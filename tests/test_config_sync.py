@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import patch
 
@@ -887,6 +888,7 @@ def argparse_ns(**kwargs):
         url = None
         all = False
         dry_run = False
+        install_packages = False
         args = []
 
     n = N()
@@ -2234,6 +2236,7 @@ class SourceArgumentTests(unittest.TestCase):
         env = git_test_env()
         env["HOME"] = str(home)
         env["XDG_DATA_HOME"] = str(home / ".local" / "share")
+        env["OMARCHY_CONFIG_SYNC_PACKAGES"] = "0"
 
         with open(tmp / "out", "w+") as out, open(tmp / "err", "w+") as err:
             proc = subprocess.Popen(
@@ -2298,6 +2301,251 @@ class SourceArgumentTests(unittest.TestCase):
         with patch("sys.stdin", io.StringIO("\n")):
             args = argparse_ns(stdin=True, args=["https://github.com/c/d.git"])
             self.assertEqual(cs.read_source_argument(args), "https://github.com/c/d.git")
+
+
+class PackageTests(unittest.TestCase):
+    """Installed-program syncing via pkg-repo.txt / pkg-aur.txt.
+
+    Every test that touches package state must stub pacman and the Omarchy
+    default-package files: the real machine database and /usr/share/omarchy
+    must never leak into assertions (and the panel must never hang on a pacman
+    lock while the tests run).
+    """
+
+    def _pkg_context(self, *, explicit_repo=(), explicit_aur=(), installed=(), default_names=(), omarchy_bin="/usr/bin/omarchy", capture_install=True, calls_out=None):
+        """Patch pacman queries, Omarchy defaults, and (optionally) omarchy
+        install. Git subprocesses keep running through the real run_bounded."""
+        stack = ExitStack()
+        real_which = shutil.which
+        real_run_bounded = cs.run_bounded
+        defaults_dir = Path(tempfile.mkdtemp())
+        write(defaults_dir / "omarchy-base.packages", "".join(f"{n}\n" for n in sorted(default_names)))
+        write(defaults_dir / "omarchy-other.packages", "")
+        captured: list[list[str]] = calls_out if calls_out is not None else []
+
+        def query(binary: str, args: list[str]) -> list[str]:
+            if args == ["-Qqen"]:
+                return list(explicit_repo)
+            if args == ["-Qqem"]:
+                return list(explicit_aur)
+            if args == ["-Qq"]:
+                return list(installed)
+            return []
+
+        def which(name: str) -> str | None:
+            if name == "pacman":
+                return "/usr/bin/pacman"
+            if name == "omarchy":
+                return omarchy_bin
+            return real_which(name)
+
+        def bounded(cmd: list[str], **kw) -> subprocess.CompletedProcess[str]:
+            if cmd and cmd[0] == omarchy_bin:
+                captured.append(cmd)
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            return real_run_bounded(cmd, **kw)
+
+        stack.enter_context(patch.object(cs, "_pacman_query", side_effect=query))
+        stack.enter_context(patch.object(cs.shutil, "which", side_effect=which))
+        stack.enter_context(patch.object(cs, "OMARCHY_PKG_DIR", str(defaults_dir)))
+        if capture_install:
+            stack.enter_context(patch.object(cs, "run_bounded", side_effect=bounded))
+        self.addCleanup(stack.close)
+        self.addCleanup(shutil.rmtree, defaults_dir, True)
+        return stack
+
+    @staticmethod
+    def _omarchy_calls(calls: list[list[str]]) -> list[list[str]]:
+        return [c for c in calls if c and c[0].endswith("omarchy")]
+
+    def test_live_pkgs_prune_defaults_and_report_drift(self) -> None:
+        with TempHome() as env:
+            env.ctx.track_packages = True
+            repo = make_config_repo(env.home / "cfg")
+            write(repo / "pkg-repo.txt", "firefox\nhelix\nvim-gtk\n")
+            write(repo / "pkg-aur.txt", "paru\n")
+            commit_all(repo, "track packages")
+            with self._pkg_context(
+                explicit_repo=["firefox", "alacritty", "brave", "helix"],
+                explicit_aur=["paru"],
+                installed=["firefox", "brave", "helix", "glibc"],
+                default_names=["firefox", "alacritty", "glibc"],
+            ):
+                cache = cs.live_pkg_files(env.ctx, force=True)
+                self.assertEqual(cs._read_pkg_list(cache[cs.PKG_REPO_REL]), ["brave", "helix"])
+                self.assertEqual(cs._read_pkg_list(cache[cs.PKG_AUR_REL]), ["paru"])
+                self.assertIn(cs.PKG_INSTALLED_REL, [p.name for p in cache.values()])
+                self.assertFalse((repo / "installed.txt").exists())
+                self.assertFalse((repo / "installed.txt").is_file())
+
+                inv = [i["path"] for i in cs.collect_inventory(env.ctx, repo)]
+                self.assertIn(cs.PKG_REPO_REL, inv)
+                self.assertIn(cs.PKG_AUR_REL, inv)
+
+                drift = cs.package_drift(env.ctx, repo)
+                self.assertEqual(drift["live"], {"repo": 2, "aur": 1})
+                self.assertEqual(drift["captured"], {"repo": 3, "aur": 1})
+                self.assertEqual(drift["missing"], {"repo": ["vim-gtk"], "aur": ["paru"]})
+                self.assertEqual(drift["unsynced"], {"repo": ["brave"], "aur": []})
+                self.assertEqual(drift["counts"], {"missing": 2, "unsynced": 1})
+
+    def test_pkg_items_require_tracking(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            write(repo / "pkg-repo.txt", "alpha\n")
+            commit_all(repo, "add pkg list")
+            # Default Context is tracking-off: no cache is generated, so the
+            # machine's real package DB (and pacman) are never touched.
+            inv = [i["path"] for i in cs.collect_inventory(env.ctx, repo)]
+            self.assertNotIn(cs.PKG_REPO_REL, inv)
+            self.assertNotIn(cs.PKG_AUR_REL, inv)
+            self.assertEqual(cs.package_drift(env.ctx, repo)["tracked"], False)
+
+    def test_pkg_files_are_not_default_apply_and_never_file_copied(self) -> None:
+        with TempHome() as env:
+            env.ctx.track_packages = True
+            repo = make_config_repo(env.home / "cfg")
+            write(repo / "pkg-repo.txt", "brave\n")
+            write(repo / "pkg-aur.txt", "paru\n")
+            commit_all(repo, "track packages")
+            with self._pkg_context(
+                explicit_repo=["firefox", "brave"],
+                explicit_aur=["paru"],
+                installed=["firefox", "glibc"],
+                default_names=["firefox", "glibc"],
+            ):
+                cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+                snap = cs.cmd_snapshot(env.ctx, argparse_ns(fetch=False))
+                for f in snap["diff"]["files"]:
+                    if f["path"] == cs.PKG_REPO_REL:
+                        self.assertFalse(f["default_apply"])
+                res = cs.cmd_apply(env.ctx, argparse_ns(explicit=True, files="pkg-repo.txt,pkg-aur.txt", install_packages=True))
+                self.assertNotIn(cs.PKG_REPO_REL, res["applied"])
+                self.assertNotIn(cs.PKG_AUR_REL, res["applied"])
+                self.assertEqual(res["packages"]["installed"], ["brave", "paru"])
+
+    def test_apply_without_install_flag_never_installs(self) -> None:
+        with TempHome() as env:
+            env.ctx.track_packages = True
+            repo = make_config_repo(env.home / "cfg")
+            write(repo / "pkg-repo.txt", "brave\n")
+            commit_all(repo, "track packages")
+            calls: list[list[str]] = []
+            with self._pkg_context(
+                explicit_repo=["firefox", "brave"],
+                explicit_aur=[],
+                installed=["firefox", "glibc"],
+                default_names=["firefox", "glibc"],
+                calls_out=calls,
+            ):
+                cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+                res = cs.cmd_apply(env.ctx, argparse_ns(explicit=True, files="pkg-repo.txt"))
+                self.assertEqual(self._omarchy_calls(calls), [])
+                self.assertNotIn(cs.PKG_REPO_REL, res.get("applied", []))
+                self.assertNotIn(res.get("message", ""), "omarchy")
+
+    def test_apply_installs_missing_packages_and_reports(self) -> None:
+        with TempHome() as env:
+            env.ctx.track_packages = True
+            repo = make_config_repo(env.home / "cfg")
+            write(repo / "pkg-repo.txt", "brave\nvim-gtk\n")
+            write(repo / "pkg-aur.txt", "paru\n")
+            commit_all(repo, "track packages")
+            calls: list[list[str]] = []
+            with self._pkg_context(
+                explicit_repo=["firefox", "vim-gtk"],
+                explicit_aur=["paru"],
+                installed=["firefox", "vim-gtk", "glibc"],
+                default_names=["firefox", "glibc"],
+                calls_out=calls,
+            ):
+                cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+                res = cs.cmd_apply(env.ctx, argparse_ns(explicit=True, files="pkg-repo.txt,pkg-aur.txt", install_packages=True))
+                self.assertEqual(res["packages"]["installed"], ["brave", "paru"])
+                self.assertEqual(res["packages"]["failed"], [])
+                self.assertIn("Installed 2 packages", res["packages"]["message"])
+                self.assertIn("Installed 2 packages", res["message"])
+                self.assertEqual(
+                    self._omarchy_calls(calls),
+                    [
+                        ["/usr/bin/omarchy", "pkg", "add", "brave"],
+                        ["/usr/bin/omarchy", "pkg", "aur", "add", "paru"],
+                    ],
+                )
+
+    def test_publish_force_refreshes_cache_before_committing(self) -> None:
+        with TempHome() as env:
+            env.ctx.track_packages = True
+            repo = make_config_repo(env.home / "cfg")
+            write(repo / "pkg-repo.txt", "alpha\n")
+            commit_all(repo, "track alpha")
+            with self._pkg_context(
+                explicit_repo=["alpha", "beta", "glibc"],
+                explicit_aur=[],
+                installed=["alpha", "beta", "glibc"],
+                default_names=["glibc"],
+            ):
+                cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+                res = cs.cmd_publish(env.ctx, argparse_ns(explicit=True, files="pkg-repo.txt", push=False))
+                self.assertTrue(res["ok"], res)
+                self.assertIn(cs.PKG_REPO_REL, res["published"])
+                self.assertEqual(cs._read_pkg_list(repo / cs.PKG_REPO_REL), ["alpha", "beta"])
+
+    def test_snapshot_declares_package_drift_in_status(self) -> None:
+        with TempHome() as env:
+            env.ctx.track_packages = True
+            repo = make_config_repo(env.home / "cfg")
+            write(repo / "pkg-repo.txt", "brave\nvim-gtk\n")
+            write(repo / "pkg-aur.txt", "paru\n")
+            commit_all(repo, "track packages")
+            with self._pkg_context(
+                explicit_repo=["brave", "vim-gtk", "firefox"],
+                explicit_aur=["paru"],
+                installed=["brave", "paru", "firefox", "glibc"],
+                default_names=["firefox", "glibc"],
+            ):
+                cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+                snap = cs.cmd_snapshot(env.ctx, argparse_ns(fetch=False))
+                pkgs = snap["status"]["packages"]
+                self.assertTrue(pkgs["tracked"])
+                self.assertEqual(pkgs["counts"]["missing"], 1)
+                self.assertEqual(pkgs["missing"], {"repo": ["vim-gtk"], "aur": []})
+
+    def test_summarize_file_diff_describes_package_changes(self) -> None:
+        with TempHome() as env:
+            env.ctx.track_packages = True
+            repo = make_config_repo(env.home / "cfg")
+            write(repo / "pkg-repo.txt", "alacritty\nhelix\n")
+            commit_all(repo, "track packages")
+            with self._pkg_context(
+                explicit_repo=["alacritty", "helix", "brave"],
+                explicit_aur=[],
+                installed=["alacritty", "helix", "brave", "glibc"],
+                default_names=["glibc"],
+            ):
+                cache = cs.live_pkg_files(env.ctx, force=True)
+                local_path = cache[cs.PKG_REPO_REL]
+                summary, _ = cs.summarize_file_diff(
+                    cs.PKG_REPO_REL,
+                    local_path,
+                    repo / cs.PKG_REPO_REL,
+                    "local",
+                    local_within=env.home,
+                    repo_within=repo,
+                )
+                self.assertIn("1 new official packages", summary)
+                self.assertIn("brave", summary)
+                same = env.home / "same-pkgs.txt"
+                write(same, "alacritty\nhelix\n")
+                summary_same, _ = cs.summarize_file_diff(
+                    cs.PKG_REPO_REL,
+                    same,
+                    repo / cs.PKG_REPO_REL,
+                    "local",
+                    local_within=env.home,
+                    repo_within=repo,
+                )
+                self.assertIn("no package difference", summary_same)
 
 
 class PluginVersionTests(unittest.TestCase):

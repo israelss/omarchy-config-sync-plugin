@@ -73,7 +73,7 @@ SKIP_DIR_NAMES = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", "node_m
 SKIP_FILE_NAMES = {".DS_Store"}
 SKIP_NAME_RE = re.compile(r"\.bak(\.|$)")
 PROTECTED_PLUGINS = {PLUGIN_ID}  # this plugin is excluded from sync so it does not self-report or overwrite itself
-PLUGIN_VERSION = "1.2.22"
+PLUGIN_VERSION = "1.2.23"
 
 FILE_SUMMARIES = {
     "hypr/autostart.lua": "Autostart programs",
@@ -88,11 +88,31 @@ FILE_SUMMARIES = {
     "omarchy/shell.json": "Bar layout, widgets, and idle lock",
     "omarchy/shell.toml": "Shell font and type scale",
     "omarchy/theme.name": "Selected Omarchy theme",
+    "pkg-repo.txt": "Installed packages (official)",
+    "pkg-aur.txt": "Installed packages (AUR)",
 }
 
 MACHINE_LOCAL_PATHS = {"hypr/monitors.lua"}
 THEME_REL = "omarchy/theme.name"
 THEME_SKIP_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
+
+# Installed-package tracking. The repo keeps two sidecar lists describing the
+# packages this machine has beyond the Omarchy default set: one for official
+# repo packages (pkg-repo.txt) and one for AUR/foreign packages (pkg-aur.txt).
+# The lists are generated from the live system into the state dir and treated
+# by the diff exactly like config files, so "a new package was installed but
+# not published yet" shows up as a normal outgoing change; applying installs
+# the packages a repo lists that this machine lacks.
+PKG_REPO_REL = "pkg-repo.txt"
+PKG_AUR_REL = "pkg-aur.txt"
+PKG_RELS = (PKG_REPO_REL, PKG_AUR_REL)
+PKG_INSTALLED_REL = "installed.txt"  # internal cache only; never synced
+PKG_CACHE_SUBDIR = "live-pkgs"
+PKG_CACHE_TTL_SECONDS = 60
+PKG_QUERY_TIMEOUT = 30
+PKG_INSTALL_TIMEOUT = 1500
+OMARCHY_PKG_DIR = "/usr/share/omarchy/install"
+OMARCHY_PKG_FILES = ("omarchy-base.packages", "omarchy-other.packages")
 
 
 class SyncError(Exception):
@@ -107,6 +127,11 @@ class Context:
     state_dir: Path
     default_clone: Path
     plugin_root: Path | None = None
+    # Installed-package tracking queries pacman and refreshes the generated
+    # lists. It is True only for the real CLI (Context.from_env); tests keep
+    # it False so running the suite on an Omarchy box never shells out to the
+    # host package DB.
+    track_packages: bool = False
 
     @classmethod
     def from_env(cls) -> "Context":
@@ -116,7 +141,8 @@ class Context:
         plugin_root = home / ".config" / "omarchy" / "plugins" / PLUGIN_ID
         if not plugin_root.is_dir():
             plugin_root = None
-        return cls(home=home, state_dir=state_dir, default_clone=state_dir / "repo", plugin_root=plugin_root)
+        track = os.environ.get("OMARCHY_CONFIG_SYNC_PACKAGES", "1") != "0"
+        return cls(home=home, state_dir=state_dir, default_clone=state_dir / "repo", plugin_root=plugin_root, track_packages=track)
 
     @property
     def state_path(self) -> Path:
@@ -1289,6 +1315,236 @@ def terminal_map(ctx: Context) -> dict[str, Path]:
     }
 
 
+def read_omarchy_default_pkgs(dir_path: str | None = None) -> set[str]:
+    """Package names the Omarchy installer ships, so a fresh install already
+    has them. Only the delta over this set is worth syncing (same pruning
+    omarepro applies to pacman -Qqen/-Qqem)."""
+    names: set[str] = set()
+    root = Path(dir_path or OMARCHY_PKG_DIR)
+    for fname in OMARCHY_PKG_FILES:
+        try:
+            lines = (root / fname).read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            line = line.split("#", 1)[0].strip()
+            if line:
+                names.add(line)
+    return names
+
+
+def _pacman_query(binary: str, args: list[str]) -> list[str]:
+    try:
+        result = run_bounded([binary, *args], timeout=PKG_QUERY_TIMEOUT, max_bytes=MAX_SUBPROCESS_BYTES)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if result.returncode != 0:
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def collect_live_pkgs(*, pacman_bin: str = "", default_pkg_dir: str | None = None) -> dict[str, list[str]]:
+    """Pruned lists of packages installed on this machine (official extras,
+    AUR extras) plus the full installed set. pacman is queried through
+    run_bounded so the panel cannot hang on a hung database lock."""
+    binary = pacman_bin or (shutil.which("pacman") or "")
+    if not binary:
+        return {"repo": [], "aur": [], "installed": []}
+    explicit_repo = _pacman_query(binary, ["-Qqen"])
+    explicit_aur = _pacman_query(binary, ["-Qqem"])
+    installed = _pacman_query(binary, ["-Qq"])
+    defaults = read_omarchy_default_pkgs(default_pkg_dir)
+    if defaults:
+        repo = sorted(p for p in set(explicit_repo) if p not in defaults)
+        aur = sorted(p for p in set(explicit_aur) if p not in defaults)
+    else:
+        repo = sorted(set(explicit_repo))
+        aur = sorted(set(explicit_aur))
+    return {"repo": repo, "aur": aur, "installed": sorted(set(installed))}
+
+
+def _split_pkg_text(text: str) -> set[str]:
+    out: set[str] = set()
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line:
+            out.add(line)
+    return out
+
+
+def _read_pkg_list(path: Path) -> list[str]:
+    try:
+        return sorted(_split_pkg_text(path.read_text(encoding="utf-8")))
+    except OSError:
+        return []
+
+
+def _write_pkg_list(path: Path, pkgs: list[str]) -> None:
+    ensure_parent(path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text("".join(f"{p}\n" for p in pkgs), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def live_pkg_cache_dir(ctx: Context) -> Path:
+    return ctx.state_dir / PKG_CACHE_SUBDIR
+
+
+def _pkg_cache_stale(path: Path) -> bool:
+    if not path.is_file():
+        return True
+    try:
+        return time.time() - path.stat().st_mtime > PKG_CACHE_TTL_SECONDS
+    except OSError:
+        return True
+
+
+def live_pkg_files(ctx: Context, force: bool = False) -> dict[str, Path]:
+    """Path to the generated package lists for this machine.
+
+    The lists live in the state dir ('live-pkgs'), not in ~/.config, and are a
+    normal diff participant: the repo side is pkg-repo.txt/pkg-aur.txt and the
+    local side is the generated cache. Regeneration happens when the cache is
+    missing, older than PKG_CACHE_TTL_SECONDS, or force=True (used right before
+    a Publish so the committed lists match the machine at publish time). When
+    package tracking is off the paths are returned but never created, so the
+    repo lists show up as plain incoming files and tests stay hermetic.
+    """
+    cache_dir = live_pkg_cache_dir(ctx)
+    paths = {rel: cache_dir / rel for rel in PKG_RELS}
+    paths[PKG_INSTALLED_REL] = cache_dir / PKG_INSTALLED_REL
+    if not ctx.track_packages:
+        return paths
+    needs = force or any(_pkg_cache_stale(paths[rel]) for rel in PKG_RELS)
+    if not needs:
+        return paths
+    live = collect_live_pkgs()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    _write_pkg_list(paths[PKG_REPO_REL], live["repo"])
+    _write_pkg_list(paths[PKG_AUR_REL], live["aur"])
+    _write_pkg_list(paths[PKG_INSTALLED_REL], live["installed"])
+    return paths
+
+
+def flush_live_pkg_cache(ctx: Context) -> None:
+    """Drop the generated lists so the next snapshot refreshes them. The pacman
+    PostTransaction hook calls this after any install/upgrade/remove."""
+    cache_dir = live_pkg_cache_dir(ctx)
+    try:
+        os.unlink(cache_dir / PKG_INSTALLED_REL)
+    except OSError:
+        pass
+    for rel in PKG_RELS:
+        try:
+            os.unlink(cache_dir / rel)
+        except OSError:
+            pass
+
+
+def is_package_list_rel(rel: str) -> bool:
+    return rel == PKG_REPO_REL or rel == PKG_AUR_REL
+
+
+def repo_package_lists(repo: Path) -> dict[str, list[str]]:
+    return {"repo": _read_pkg_list(repo / PKG_REPO_REL), "aur": _read_pkg_list(repo / PKG_AUR_REL)}
+
+
+def package_drift(ctx: Context, repo: Path) -> dict[str, Any]:
+    """Compare the repo's captured package lists against this machine.
+
+    'missing' = packages the repo lists that this machine does not have at all
+    (Apply/install restores these). 'unsynced' = packages installed here that
+    the repo does not list yet (Publish picks these up). Both are capped at the
+    handful of names the panel needs to render, never the full DB.
+    """
+    base: dict[str, Any] = {
+        "tracked": ctx.track_packages,
+        "live": {"repo": 0, "aur": 0},
+        "captured": {"repo": 0, "aur": 0},
+        "missing": {"repo": [], "aur": []},
+        "unsynced": {"repo": [], "aur": []},
+        "counts": {"missing": 0, "unsynced": 0},
+    }
+    if not ctx.track_packages:
+        return base
+    if not any((repo / rel).is_file() for rel in PKG_RELS):
+        return base
+    cache = live_pkg_files(ctx)
+    repo_lists = repo_package_lists(repo)
+    live_repo = set(_read_pkg_list(cache[PKG_REPO_REL]))
+    live_aur = set(_read_pkg_list(cache[PKG_AUR_REL]))
+    installed = set(_read_pkg_list(cache[PKG_INSTALLED_REL]))
+    missing_repo = sorted(p for p in repo_lists["repo"] if p not in installed)
+    missing_aur = sorted(p for p in repo_lists["aur"] if p not in installed)
+    unsynced_repo = sorted(live_repo - set(repo_lists["repo"]))
+    unsynced_aur = sorted(live_aur - set(repo_lists["aur"]))
+    base["live"] = {"repo": len(live_repo), "aur": len(live_aur)}
+    base["captured"] = {"repo": len(repo_lists["repo"]), "aur": len(repo_lists["aur"])}
+    base["missing"] = {"repo": missing_repo, "aur": missing_aur}
+    base["unsynced"] = {"repo": unsynced_repo, "aur": unsynced_aur}
+    base["counts"] = {"missing": len(missing_repo) + len(missing_aur), "unsynced": len(unsynced_repo) + len(unsynced_aur)}
+    return base
+
+
+def install_missing_packages(ctx: Context, repo: Path, *, dry_run: bool = False) -> dict[str, Any]:
+    """Install packages the repo's pkg-*.txt lists that this machine lacks.
+
+    Gated on --install-packages so Apply never silently runs pacman. Returns a
+    report the snapshot carries; a failed install is recorded, not fatal, so the
+    rest of Apply still lands (the user can retry from a terminal, where pacman
+    can prompt for sudo)."""
+    result: dict[str, Any] = {
+        "tracked": ctx.track_packages,
+        "installed": [],
+        "failed": [],
+        "message": "",
+    }
+    if not ctx.track_packages:
+        return result
+    repo_lists = repo_package_lists(repo)
+    cache = live_pkg_files(ctx)
+    installed = set(_read_pkg_list(cache[PKG_INSTALLED_REL]))
+    groups = [
+        ("repo", [p for p in repo_lists["repo"] if p not in installed]),
+        ("aur", [p for p in repo_lists["aur"] if p not in installed]),
+    ]
+    pending = [(kind, pkgs) for kind, pkgs in groups if pkgs]
+    if not pending:
+        result["message"] = "All packages in the repo are already installed."
+        return result
+    if dry_run:
+        result["installed"] = [p for _, pkgs in pending for p in pkgs]
+        result["dry_run"] = True
+        total = sum(len(pkgs) for _, pkgs in pending)
+        result["message"] = f"Would install {total} package{'s' if total != 1 else ''} from the repo."
+        return result
+    omarchy = shutil.which("omarchy")
+    if not omarchy:
+        result["failed"] = [p for _, pkgs in pending for p in pkgs]
+        result["message"] = "package install skipped: omarchy command not found."
+        return result
+    for kind, pkgs in pending:
+        args = [omarchy, "pkg", "add", *pkgs] if kind == "repo" else [omarchy, "pkg", "aur", "add", *pkgs]
+        try:
+            proc = run_bounded(args, timeout=PKG_INSTALL_TIMEOUT, max_bytes=MAX_SUBPROCESS_BYTES)
+        except subprocess.TimeoutExpired:
+            result["failed"] += pkgs
+            result["message"] = (result["message"] + f" AUR install timed out after {PKG_INSTALL_TIMEOUT}s.").strip()
+            continue
+        if proc.returncode == 0:
+            result["installed"] += pkgs
+        else:
+            result["failed"] += pkgs
+            detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            result["message"] = (
+                (result["message"] + " " if result["message"] else "")
+                + f"{kind} install failed ({proc.returncode}): {detail[-1] if detail else 'see omarchy output'}"
+            ).strip()
+    if not result["failed"]:
+        result["message"] = f"Installed {len(result['installed'])} package{'s' if len(result['installed']) != 1 else ''}."
+    return result
+
+
 def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
     items: dict[str, dict[str, Any]] = {}
     if _tree_disk_usage(repo, MAX_REPO_DISK_BYTES) > MAX_REPO_DISK_BYTES:
@@ -1418,6 +1674,17 @@ def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
         repo_file = repo / rel
         if local.is_file() or repo_file.is_file():
             add(rel, local, repo_file, "terminal")
+
+    # Installed-package lists. Only repos that already track packages get the
+    # generated lists added to the inventory, so adding this feature can never
+    # change how an existing repo publishes/commits. Once pkg-repo.txt is in
+    # the repo, the local (generated) side participates in the diff exactly
+    # like a config file: new packages appear as an outgoing "local" change.
+    repo_pkgs = [repo / rel for rel in PKG_RELS]
+    if any(p.is_file() for p in repo_pkgs) and ctx.track_packages:
+        live_paths = live_pkg_files(ctx)
+        add(PKG_REPO_REL, live_paths[PKG_REPO_REL], repo / PKG_REPO_REL, "packages")
+        add(PKG_AUR_REL, live_paths[PKG_AUR_REL], repo / PKG_AUR_REL, "packages")
 
     bin_names: set[str] = set()
     repo_bin = repo / "bin"
@@ -1691,6 +1958,29 @@ def summarize_file_diff(
         return ("", [])
 
     changes: list[str] = []
+
+    # 0. Installed-package lists. The local side is the generated cache, the
+    # repo side is the captured list, so a readable summary is just the set
+    # difference of package names.
+    if rel in PKG_RELS:
+        label = "official packages" if rel == PKG_REPO_REL else "AUR packages"
+        local_names = _split_pkg_text(local_text)
+        repo_names = _split_pkg_text(repo_text)
+        if status in {"local", "added-local"}:
+            add_pkgs = sorted(local_names - repo_names)
+            drop_pkgs = sorted(repo_names - local_names)
+        else:
+            add_pkgs = sorted(repo_names - local_names)
+            drop_pkgs = sorted(local_names - repo_names)
+        parts = []
+        if add_pkgs:
+            names = ", ".join(add_pkgs[:5]) + ("…" if len(add_pkgs) > 5 else "")
+            parts.append(f"{len(add_pkgs)} new {label}" + (f" ({names})" if names else ""))
+        if drop_pkgs:
+            parts.append(f"{len(drop_pkgs)} {label} dropped")
+        if parts:
+            return ("; ".join(parts), [])
+        return ("no package difference", [])
 
     # 1. omarchy/shell.json
     if rel == "omarchy/shell.json":
@@ -2500,6 +2790,7 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
             and not item["hidden"]
             and not is_bundled_path(item["path"])
             and not is_executable_payload(item["path"])
+            and not is_package_list_rel(item["path"])
         )
         item["default_publish"] = default_publish_status(status) and item["local_exists"] and not item["hidden"]
         # A tracked file gone from one side is a removal, not a one-sided edit:
@@ -2727,6 +3018,7 @@ def build_snapshot(ctx: Context, fetch: bool = False) -> dict[str, Any]:
         "unknown_differs": diff["counts"].get("differs", 0),
         "shortcut_changes": len([s for s in (diff.get("shortcuts") or []) if not s.get("hidden")]),
         "plugin_changes": len([p for p in (diff.get("plugins") or []) if not p.get("hidden")]),
+        "packages": package_drift(ctx, repo),
         "hidden": state.get("hidden") or [],
         "hidden_count": len(state.get("hidden") or []),
         "plugin_version": PLUGIN_VERSION,
@@ -3247,7 +3539,13 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     chosen = selected_items(diff["files"], wanted, bool(args.include_machine), "apply")
     if shortcut_keys:
         chosen = [i for i in chosen if i["path"] != "hypr/bindings.lua"]
-    if not chosen and not shortcut_keys:
+    # Package lists are restored by installing the packages, not by copying the
+    # list file over the generated cache, so they never count as file work.
+    # --install-packages is the explicit switch that lets Apply run pacman.
+    pkg_wanted = bool(getattr(args, "install_packages", False))
+    chosen = [i for i in chosen if not is_package_list_rel(i["path"])]
+    pkg_plan = install_missing_packages(ctx, repo, dry_run=True) if pkg_wanted else {}
+    if not chosen and not shortcut_keys and not pkg_wanted:
         snap = build_snapshot(ctx, fetch=False)
         snap["applied"] = []
         snap["removed"] = []
@@ -3268,12 +3566,14 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         snap = build_snapshot(ctx, fetch=False)
         snap["applied"] = applied
         snap["removed"] = removed
+        snap["packages"] = pkg_plan if pkg_wanted else package_drift(ctx, repo)
         snap["dry_run"] = True
-        snap["message"] = (
-            f"Dry run: would apply {len(applied)} file{'s' if len(applied) != 1 else ''}"
-            + (f" ({len(removed)} removed from this machine)" if removed else "")
-            + "."
-        )
+        msg = f"Dry run: would apply {len(applied)} file{'s' if len(applied) != 1 else ''}"
+        msg += f" ({len(removed)} removed from this machine)" if removed else ""
+        if pkg_wanted:
+            msg += f" {pkg_plan.get('message', '')}".strip()
+        msg += "."
+        snap["message"] = msg
         return snap
 
     shell_path = ctx.config_omarchy / "shell.json"
@@ -3322,6 +3622,10 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
             applied.append("hypr/bindings.lua")
     restore_widget_entry(shell_path, section, widget_entry, widget_index, within=ctx.home)
 
+    pkg_result = {}
+    if pkg_wanted:
+        pkg_result = install_missing_packages(ctx, repo, dry_run=False)
+
     # Refresh hashes for every tracked file after apply.
     post = collect_inventory(ctx, repo)
     hashes = dict(state.get("file_hashes") or {})
@@ -3355,15 +3659,21 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     snap["applied"] = applied
     snap["backup_dir"] = str(backup_dir)
     snap["reload"] = notes
+    snap["packages"] = pkg_result if pkg_wanted else package_drift(ctx, repo)
     theme_msg = ""
     if THEME_REL in applied:
         slug = read_theme_slug(ctx.theme_name_path, within=ctx.home)
         if slug:
             theme_msg = f" Theme set to {theme_display_name(slug)}."
+    pkg_msg = ""
+    if pkg_result:
+        pkg_msg = (pkg_result.get("message") or "").strip()
+        if pkg_msg:
+            pkg_msg = (" " if not pkg_msg.startswith(".") else "") + pkg_msg
     snap["message"] = (
         f"Applied {len(applied)} file{'s' if len(applied) != 1 else ''} from the repo"
         + (f" ({len(removed)} removed from this machine)" if removed else "")
-        + f".{theme_msg}"
+        + f".{pkg_msg}{theme_msg}"
     )
     snap["removed"] = removed
     return snap
@@ -3397,6 +3707,10 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
             or "The clone has uncommitted changes, so origin could not be merged in. Open the clone and clean it up, then Publish.",
             extra={"ahead": git_fields["ahead"], "behind": git_fields["behind"]},
         )
+    if any((repo / rel).is_file() for rel in PKG_RELS) and ctx.track_packages:
+        # Refresh the generated package lists so what gets committed reflects
+        # the machine at publish time, not whenever the last snapshot ran.
+        live_pkg_files(ctx, force=True)
     diff = annotate_diff(ctx, repo, state)
     explicit = bool(getattr(args, "explicit", False))
     shortcut_keys = [s for s in (getattr(args, "shortcut", None) or []) if s]
@@ -4008,6 +4322,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stdin", action="store_true", help="Read input URL from stdin")
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--install-packages",
+        action="store_true",
+        help="Install the packages in pkg-repo.txt/pkg-aur.txt that this machine lacks (Apply only).",
+    )
     return parser
 
 

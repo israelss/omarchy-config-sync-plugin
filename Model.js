@@ -31,9 +31,14 @@ function stateHint(state, status) {
   var repoN = status && status.repo_changes ? Number(status.repo_changes) : 0
   var bothN = status && status.both_changed ? Number(status.both_changed) : 0
   var differs = status && status.unknown_differs ? Number(status.unknown_differs) : 0
+  var pkgCounts = status && status.packages && status.packages.counts
+  var missingPkg = pkgCounts ? Number(pkgCounts.missing || 0) : 0
+  var pkgHint = missingPkg > 0
+    ? (missingPkg === 1 ? " 1 package available to install." : " " + missingPkg + " packages available to install.")
+    : ""
   switch (String(state || "")) {
     case "in-sync":
-      return "This machine matches the linked config repo."
+      return "This machine matches the linked config repo." + pkgHint
     case "empty":
       return "This GitHub repo is empty (or only has a README). The tabs show this machine. Press Publish this machine to seed the private repo, then use Apply on your other machines."
     case "ready":
@@ -43,7 +48,7 @@ function stateHint(state, status) {
         ? "1 local change is not in the repo yet. Publish to share it with your other machines."
         : localN + " local changes are not in the repo yet. Publish to share them with your other machines."
     case "remote-ahead":
-      return "The repo has config this machine has not applied. Review the incoming files, then Apply."
+      return "The repo has config this machine has not applied. Review the incoming files, then Apply." + pkgHint
     case "diverged":
       return "This machine and the repo both moved. Review Changes to pick a side item by item, or Resync from repo to make this machine match git (usual on a second machine)."
     case "conflicts":

@@ -47,6 +47,14 @@ Panel {
   property var themeDiff: null
   property bool openOnChanges: false
   property bool showingHidden: false
+  property bool installPackages: false
+
+  readonly property var pkgCounts: (status && status.packages && status.packages.counts) || null
+  readonly property int missingPkgCount: pkgCounts ? Number(pkgCounts.missing || 0) : 0
+  readonly property int pkgCaptured: {
+    if (!status || !status.packages || !status.packages.captured) return -1
+    return Number(status.packages.captured.repo || 0) + Number(status.packages.captured.aur || 0)
+  }
 
   readonly property bool configured: !!(status && status.configured)
   readonly property string reportedSyncState: String((status && status.sync_state) || (configured ? "in-sync" : "not-configured"))
@@ -504,7 +512,7 @@ Panel {
       activeTab = 1
       return
     }
-    if (selectedApplyFiles().length + selectedApplyShortcuts().length + selectedApplyPlugins().length + selectedBundleFiles("apply").length === 0 && !selectedApplyTheme()) {
+    if (selectedApplyFiles().length + selectedApplyShortcuts().length + selectedApplyPlugins().length + selectedBundleFiles("apply").length === 0 && !selectedApplyTheme() && !(installPackages && missingPkgCount > 0)) {
       lastError = "Check the incoming shortcuts, plugins, or files you want to apply."
       activeTab = 1
       return
@@ -544,6 +552,7 @@ Panel {
       for (ai = 0; ai < ashort.length; ai++) args.push("--shortcut", ashort[ai])
       for (ai = 0; ai < aplugs.length; ai++) args.push("--plugin", aplugs[ai])
       if (selectedApplyTheme()) args.push("--theme")
+      if (installPackages && missingPkgCount > 0) args.push("--install-packages")
       run(args)
     } else if (kind === "publish") {
       var pub = selectedPublishFiles().concat(selectedBundleFiles("publish"))
@@ -1198,6 +1207,30 @@ Panel {
             }
 
             Row {
+              visible: root.confirmKind === "apply" && root.pkgCounts !== null
+              spacing: Style.space(8)
+              layoutDirection: Qt.RightToLeft
+
+              Text {
+                textFormat: Text.PlainText
+                text: root.missingPkgCount > 0
+                  ? "Also install the " + root.missingPkgCount + " missing package" + (root.missingPkgCount === 1 ? "" : "s") + " from pkg-repo.txt/pkg-aur.txt"
+                  : "All packages in the repo are already installed here."
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                wrapMode: Text.WordWrap
+              }
+              ToggleSwitch {
+                checked: root.installPackages
+                enabled: root.missingPkgCount > 0
+                foreground: root.foreground
+                accent: root.accent
+                onToggled: root.installPackages = checked
+              }
+            }
+
+            Row {
               spacing: Style.space(8)
               layoutDirection: Qt.RightToLeft
               width: parent.width
@@ -1241,7 +1274,7 @@ Panel {
       Row {
         width: parent.width
         spacing: Style.space(8)
-        readonly property real pillW: (width - spacing * 3) / 4
+        readonly property real pillW: (width - spacing * 4) / 5
 
         QuickPill {
           width: parent.pillW
@@ -1268,6 +1301,18 @@ Panel {
           label: "Outgoing"
           value: String(root.outgoingCount)
           highlightColor: root.outgoingCount > 0 ? root.accent : root.foreground
+        }
+        QuickPill {
+          width: parent.pillW
+          icon: "󰏓"
+          label: "Packages"
+          value: root.pkgCaptured >= 0 ? String(root.pkgCaptured) : "—"
+          highlightColor: root.missingPkgCount > 0 ? root.urgent : root.foreground
+          tooltipText: root.pkgCounts === null
+            ? "Add pkg-repo.txt to the repo to start syncing installed programs."
+            : root.missingPkgCount === 0
+              ? "Installed programs match the repo."
+              : root.missingPkgCount + " package" + (root.missingPkgCount === 1 ? " is" : "s are") + " available to install on Apply."
         }
       }
 
@@ -3224,12 +3269,22 @@ Panel {
     property string icon: ""
     property string label: ""
     property string value: ""
+    property string tooltipText: ""
     property color highlightColor: root.foreground
     implicitHeight: Style.space(42)
     radius: Style.cornerRadius
     color: root.cardBg
     border.width: 1
     border.color: root.cardBorder
+
+    HoverHandler {
+      id: pillHover
+      cursorShape: Qt.PointingHandCursor
+    }
+    ToolTip.visible: pillHover.hovered && tooltipText.length > 0
+    ToolTip.text: tooltipText
+    ToolTip.delay: 600
+
     Column {
       anchors.centerIn: parent
       spacing: 1

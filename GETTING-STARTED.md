@@ -133,6 +133,28 @@ The selected Omarchy theme (`omarchy theme current`) is part of that list. Stock
 
 Both machines need the **same Config Sync plugin version** (Overview shows `Plugin: config-sync` plus the version from `manifest.json`). Incoming/outgoing groups, Include checkboxes, and Resync live in that version. Update with `omarchy plugin update gladimdim.config-sync --yes`, or copy `~/.config/omarchy/plugins/gladimdim.config-sync/` from a machine that already has the current version, then `omarchy restart shell`. Removing the plugin also forgets the linked repo, so a reinstall starts at Connect.
 
+---
+
+## Installed programs (pkg-repo.txt / pkg-aur.txt)
+
+Config Sync can also keep track of the programs you installed beyond the Omarchy defaults. When the repo contains `pkg-repo.txt` (official packages) or `pkg-aur.txt` (AUR packages), the plugin:
+
+- Shows them in the **Packages** pill on the Overview tab
+- On **Apply**, lets you check *Also install the N missing packages* to run `omarchy pkg add` for you
+- On **Publish**, commits the current machine's installed package list (pruned of Omarchy defaults) so the next machine knows what to install
+
+The package files are generated from `pacman -Qqen` / `pacman -Qqem`, so only your extras show up — not the base Omarchy set.
+
+### Setting up the pacman hook (optional)
+
+A pacman hook can automatically invalidate the package cache after every install/upgrade/remove so the Packages pill always reflects the current state. Without it, the cache refreshes on the next Publish or after 60 seconds.
+
+```bash
+sudo bash scripts/pacman-hook.sh install   # writes /etc/pacman.d/hooks/config-sync.hook
+sudo bash scripts/pacman-hook.sh status    # check it's there
+sudo bash scripts/pacman-hook.sh uninstall # remove later
+```
+
 | You did this | Open the icon | Press |
 | --- | --- | --- |
 | Added a shortcut / plugin on this machine | Badge: local changes | **Publish** |

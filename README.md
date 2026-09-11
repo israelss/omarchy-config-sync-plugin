@@ -74,6 +74,7 @@ State lives in `~/.local/share/omarchy-config-sync/` so applying `shell.json` do
 | `plugins/*` | `~/.config/omarchy/plugins/` (skips this plugin and other git-managed checkouts’ `.git`) |
 | `bin/*` | `~/.local/bin/` |
 | `terminals/alacritty.toml` etc. | matching terminal config files |
+| `pkg-repo.txt`, `pkg-aur.txt` | Installed packages beyond Omarchy defaults (generated on this machine; synced to give other machines a starting list) |
 
 `hypr/monitors.lua` is tagged machine-specific and is **not** applied unless you enable **Include display layout**.
 
