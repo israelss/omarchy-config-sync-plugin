@@ -2401,6 +2401,39 @@ class PackageTests(unittest.TestCase):
             self.assertNotIn(cs.PKG_AUR_REL, inv)
             self.assertEqual(cs.package_drift(env.ctx, repo)["tracked"], False)
 
+    def test_fresh_repo_can_seed_package_lists_by_publishing(self) -> None:
+        """On the first machine the repo has no pkg files yet; the generated
+        lists must still show up as publishable items instead of nothing."""
+        with TempHome() as env:
+            env.ctx.track_packages = True
+            repo = make_config_repo(env.home / "cfg")
+            with self._pkg_context(
+                explicit_repo=["brave", "helix", "firefox"],
+                explicit_aur=["paru"],
+                installed=["brave", "helix", "firefox", "glibc"],
+                default_names=["firefox", "glibc"],
+            ):
+                inv = [i for i in cs.collect_inventory(env.ctx, repo) if i["path"].startswith("pkg-")]
+                self.assertEqual({i["path"] for i in inv}, {cs.PKG_REPO_REL, cs.PKG_AUR_REL})
+                added = {i["path"]: i for i in inv}
+                self.assertTrue(added[cs.PKG_REPO_REL]["local_exists"])
+                self.assertFalse(added[cs.PKG_REPO_REL]["repo_exists"])
+
+                drift = cs.package_drift(env.ctx, repo)
+                self.assertEqual(drift["captured"], {"repo": 0, "aur": 0})
+                self.assertEqual(drift["unsynced"], {"repo": ["brave", "helix"], "aur": ["paru"]})
+                self.assertEqual(drift["counts"], {"missing": 0, "unsynced": 3})
+
+                cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+                snap = cs.cmd_snapshot(env.ctx, argparse_ns(fetch=False))
+                pkg = next(f for f in snap["diff"]["files"] if f["path"] == cs.PKG_REPO_REL)
+                self.assertEqual(pkg["status"], "added-local")
+                self.assertTrue(pkg["default_publish"])
+
+                res = cs.cmd_publish(env.ctx, argparse_ns(explicit=True, files="pkg-repo.txt", push=False))
+                self.assertIn(cs.PKG_REPO_REL, res["published"])
+                self.assertEqual(cs._read_pkg_list(repo / cs.PKG_REPO_REL), ["brave", "helix"])
+
     def test_pkg_files_are_not_default_apply_and_never_file_copied(self) -> None:
         with TempHome() as env:
             env.ctx.track_packages = True

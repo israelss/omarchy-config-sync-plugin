@@ -51,9 +51,10 @@ Panel {
 
   readonly property var pkgCounts: (status && status.packages && status.packages.counts) || null
   readonly property int missingPkgCount: pkgCounts ? Number(pkgCounts.missing || 0) : 0
+  readonly property int unsyncedPkgCount: pkgCounts ? Number(pkgCounts.unsynced || 0) : 0
   readonly property int pkgCaptured: {
-    if (!status || !status.packages || !status.packages.captured) return -1
-    return Number(status.packages.captured.repo || 0) + Number(status.packages.captured.aur || 0)
+    if (!status || !status.packages || !status.packages.live) return -1
+    return Number(status.packages.live.repo || 0) + Number(status.packages.live.aur || 0)
   }
 
   readonly property bool configured: !!(status && status.configured)
@@ -1307,12 +1308,14 @@ Panel {
           icon: "󰏓"
           label: "Packages"
           value: root.pkgCaptured >= 0 ? String(root.pkgCaptured) : "—"
-          highlightColor: root.missingPkgCount > 0 ? root.urgent : root.foreground
+          highlightColor: root.missingPkgCount > 0 ? root.urgent : (root.unsyncedPkgCount > 0 ? root.accent : root.foreground)
           tooltipText: root.pkgCounts === null
-            ? "Add pkg-repo.txt to the repo to start syncing installed programs."
-            : root.missingPkgCount === 0
-              ? "Installed programs match the repo."
-              : root.missingPkgCount + " package" + (root.missingPkgCount === 1 ? " is" : "s are") + " available to install on Apply."
+            ? "Installed programs are not tracked in this repo."
+            : root.missingPkgCount > 0
+              ? root.missingPkgCount + " package" + (root.missingPkgCount === 1 ? " is" : "s are") + " available to install on Apply."
+              : root.unsyncedPkgCount > 0
+                ? root.unsyncedPkgCount + " package" + (root.unsyncedPkgCount === 1 ? " is" : "s are") + " installed here but not in the repo yet. Publish to capture them."
+                : "Installed programs match the repo."
         }
       }
 

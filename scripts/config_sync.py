@@ -1454,8 +1454,9 @@ def package_drift(ctx: Context, repo: Path) -> dict[str, Any]:
 
     'missing' = packages the repo lists that this machine does not have at all
     (Apply/install restores these). 'unsynced' = packages installed here that
-    the repo does not list yet (Publish picks these up). Both are capped at the
-    handful of names the panel needs to render, never the full DB.
+    the repo does not list yet (Publish picks these up). On a repo that never
+    tracked packages the captured side is empty, so every live extra shows up
+    as unsynced and the user can seed pkg-repo.txt/pkg-aur.txt by publishing.
     """
     base: dict[str, Any] = {
         "tracked": ctx.track_packages,
@@ -1466,8 +1467,6 @@ def package_drift(ctx: Context, repo: Path) -> dict[str, Any]:
         "counts": {"missing": 0, "unsynced": 0},
     }
     if not ctx.track_packages:
-        return base
-    if not any((repo / rel).is_file() for rel in PKG_RELS):
         return base
     cache = live_pkg_files(ctx)
     repo_lists = repo_package_lists(repo)
@@ -1675,13 +1674,11 @@ def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
         if local.is_file() or repo_file.is_file():
             add(rel, local, repo_file, "terminal")
 
-    # Installed-package lists. Only repos that already track packages get the
-    # generated lists added to the inventory, so adding this feature can never
-    # change how an existing repo publishes/commits. Once pkg-repo.txt is in
-    # the repo, the local (generated) side participates in the diff exactly
-    # like a config file: new packages appear as an outgoing "local" change.
-    repo_pkgs = [repo / rel for rel in PKG_RELS]
-    if any(p.is_file() for p in repo_pkgs) and ctx.track_packages:
+    # Installed-package lists. The generated cache lives under the state directory,
+    # not in ~/.config, and participates in the diff exactly like a config file.
+    # Showing them even when the repo has no pkg files yet lets the user publish
+    # the list from the first machine (status: added-local).
+    if ctx.track_packages:
         live_paths = live_pkg_files(ctx)
         add(PKG_REPO_REL, live_paths[PKG_REPO_REL], repo / PKG_REPO_REL, "packages")
         add(PKG_AUR_REL, live_paths[PKG_AUR_REL], repo / PKG_AUR_REL, "packages")
