@@ -48,6 +48,10 @@ Panel {
   property bool openOnChanges: false
   property bool showingHidden: false
   property bool installPackages: false
+  property bool installPackagesTouched: false
+  // Until the user touches the switch, Apply on a repo with missing packages
+  // is the restore path: installing what the repo lists is expected.
+  readonly property bool applyInstallPackages: installPackagesTouched ? installPackages : missingPkgCount > 0
 
   readonly property var pkgCounts: (status && status.packages && status.packages.counts) || null
   readonly property int missingPkgCount: pkgCounts ? Number(pkgCounts.missing || 0) : 0
@@ -261,8 +265,7 @@ Panel {
     for (i = 0; i < pluginDiffs.length; i++) {
       item = pluginDiffs[i]
       key = pickId("p", item.id)
-      // Plugins run code: never default-check an incoming one, only ever an outgoing publish.
-      next[key] = (key in picks) ? picks[key] : !!item.default_publish
+      next[key] = (key in picks) ? picks[key] : !!(item.default_apply || item.default_publish)
     }
     for (i = 0; i < bundleDiffs.length; i++) {
       item = bundleDiffs[i]
@@ -512,7 +515,7 @@ Panel {
       activeTab = 1
       return
     }
-    if (selectedApplyFiles().length + selectedApplyShortcuts().length + selectedApplyPlugins().length + selectedBundleFiles("apply").length === 0 && !selectedApplyTheme() && !(installPackages && missingPkgCount > 0)) {
+    if (selectedApplyFiles().length + selectedApplyShortcuts().length + selectedApplyPlugins().length + selectedBundleFiles("apply").length === 0 && !selectedApplyTheme() && !(applyInstallPackages && missingPkgCount > 0)) {
       lastError = "Check the incoming shortcuts, plugins, or files you want to apply."
       activeTab = 1
       return
@@ -552,7 +555,7 @@ Panel {
       for (ai = 0; ai < ashort.length; ai++) args.push("--shortcut", ashort[ai])
       for (ai = 0; ai < aplugs.length; ai++) args.push("--plugin", aplugs[ai])
       if (selectedApplyTheme()) args.push("--theme")
-      if (installPackages && missingPkgCount > 0) args.push("--install-packages")
+      if (applyInstallPackages && missingPkgCount > 0) args.push("--install-packages")
       run(args)
     } else if (kind === "publish") {
       var pub = selectedPublishFiles().concat(selectedBundleFiles("publish"))
@@ -1206,10 +1209,23 @@ Panel {
 
             Row {
               visible: root.confirmKind === "apply" && root.pkgCounts !== null
+              width: parent.width
               spacing: Style.space(8)
               layoutDirection: Qt.RightToLeft
 
+              ToggleSwitch {
+                id: installToggle
+                checked: root.applyInstallPackages
+                enabled: root.missingPkgCount > 0
+                foreground: root.foreground
+                accent: root.accent
+                onToggled: {
+                  root.installPackagesTouched = true
+                  root.installPackages = !root.installPackages
+                }
+              }
               Text {
+                width: parent.width - installToggle.width - parent.spacing
                 textFormat: Text.PlainText
                 text: root.missingPkgCount > 0
                   ? "Also install the " + root.missingPkgCount + " missing package" + (root.missingPkgCount === 1 ? "" : "s") + " from pkg-repo.txt/pkg-aur.txt"
@@ -1218,13 +1234,6 @@ Panel {
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.bodySmall
                 wrapMode: Text.WordWrap
-              }
-              ToggleSwitch {
-                checked: root.installPackages
-                enabled: root.missingPkgCount > 0
-                foreground: root.foreground
-                accent: root.accent
-                onToggled: root.installPackages = !root.installPackages
               }
             }
 
