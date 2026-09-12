@@ -534,6 +534,44 @@ class InspectAndSyncTests(unittest.TestCase):
             self.assertTrue((env.ctx.local_bin / "useful-tool").is_file())
             self.assertTrue(os.access(env.ctx.local_bin / "useful-tool", os.X_OK))
 
+    def test_symlinked_local_config_is_tracked_and_published(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            # Drop shell.json from the repo side so the link is purely incoming.
+            shell_rel = repo / "omarchy" / "shell.json"
+            shell_rel.unlink()
+            commit_all(repo, "drop repo shell.json")
+            # A dotfiles checkout inside $HOME holds the real shell.json; the
+            # config path is a leaf symlink to it, like on a machine whose
+            # configs live in a dotfiles repo. Omarchy's registry only enables
+            # plugins listed in shell.json's plugins[], so tracking this file is
+            # what makes a fresh machine restore enabled plugins.
+            dotfiles = env.home / "dotfiles" / "omarchy"
+            dotfiles.mkdir(parents=True, exist_ok=True)
+            write(
+                dotfiles / "shell.json",
+                json.dumps({"version": 1, "plugins": [{"id": "arkane.screenhop"}]}),
+            )
+            shell_path = env.ctx.config_omarchy / "shell.json"
+            shell_path.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(dotfiles / "shell.json", shell_path)
+
+            snap = cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            self.assertTrue(snap["ok"], snap)
+            entry = next(f for f in snap["diff"]["files"] if f["path"] == "omarchy/shell.json")
+            self.assertTrue(entry["local_exists"], entry)
+            self.assertIsNotNone(entry["local_hash"], entry)
+            self.assertEqual(entry["local_hash"], cs.file_hash(shell_path, "omarchy/shell.json", within=env.ctx.home))
+            self.assertEqual(entry["status"], "added-local")
+            self.assertTrue(entry["default_publish"])
+
+            published = cs.cmd_publish(env.ctx, argparse_ns(explicit=True, files="omarchy/shell.json"))
+            self.assertTrue(published["ok"], published)
+            repo_shell = repo / "omarchy" / "shell.json"
+            self.assertTrue(repo_shell.is_file())
+            self.assertFalse(repo_shell.is_symlink())
+            self.assertEqual(json.loads(repo_shell.read_text(encoding="utf-8"))["plugins"][0]["id"], "arkane.screenhop")
+
     def test_publish_local_shortcut_and_ignores_config_sync_plugin(self) -> None:
         with TempHome() as env:
             repo = make_config_repo(env.home / "cfg")

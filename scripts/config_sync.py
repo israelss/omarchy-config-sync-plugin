@@ -474,9 +474,36 @@ def write_json(path: Path, data: Any, within: Path | None = None) -> None:
     atomic_write_text(path, content, mode=0o600, within=within)
 
 
+def resolve_within(path: Path, within: Path | None = None) -> Path | None:
+    """Canonical location for reading a maybe-symlinked config file.
+
+    A leaf symlink inside the home tree (e.g. shell.json pointing into a
+    dotfiles checkout) is legitimate config material, not a write vector: every
+    destination write stays dir_fd-relative and replaces the leaf, so nothing
+    is ever written "through" a symlink. Returns None when the link is
+    dangling, unresolvable, or escapes `within`."""
+    try:
+        target = path.resolve()
+    except OSError:
+        return None
+    if within is not None:
+        try:
+            base = within.resolve()
+        except OSError:
+            return None
+        if not target.is_relative_to(base):
+            return None
+    return target
+
+
 def load_json(path: Path, default: Any = None, within: Path | None = None) -> Any:
-    if not path.is_file() or path.is_symlink() or os.path.islink(path):
+    if not path.is_file():
         return default
+    if path.is_symlink() or os.path.islink(path):
+        resolved = resolve_within(path, within)
+        if resolved is None:
+            return default
+        path = resolved
     data = read_bytes_bound(path, within=within)
     if data is None:
         return default
@@ -539,6 +566,11 @@ def canonical_shell_bytes(path: Path, within: Path | None = None) -> bytes | Non
 
 
 def file_hash(path: Path, rel: str, within: Path | None = None) -> str | None:
+    if path.is_symlink() or os.path.islink(path):
+        resolved = resolve_within(path, within)
+        if resolved is None:
+            return None
+        path = resolved
     if rel == "omarchy/shell.json":
         data = canonical_shell_bytes(path, within=within)
         return sha256_bytes(data) if data is not None else None
@@ -1581,7 +1613,9 @@ def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
         if file_too_large(local, MAX_SYNC_FILE_BYTES) or file_too_large(repo_file, MAX_SYNC_FILE_BYTES):
             # Not config material; skip rather than hash/copy something huge.
             return
-        local_regular = local.is_file() and not local.is_symlink() and not os.path.islink(local)
+        local_regular = local.is_file() and (
+            not local.is_symlink() or resolve_within(local, ctx.home) is not None
+        )
         repo_regular = repo_file.is_file() and not repo_file.is_symlink() and not os.path.islink(repo_file)
         items[rel] = {
             "path": rel,
@@ -3180,8 +3214,14 @@ def copy_mapped_file(
         src_fd = os.open(str(src), flags)
     except OSError as exc:
         if exc.errno == errno.ELOOP:
-            raise SyncError(f"Refusing to copy symlink: {src}") from exc
-        raise SyncError(f"Missing source file: {src}") from exc
+            if direction != "publish":
+                raise SyncError(f"Refusing to copy symlink: {src}") from exc
+            target = resolve_within(src, src_root)
+            if target is None:
+                raise SyncError(f"Refusing to copy symlink: {src}") from exc
+            src_fd = os.open(str(target), flags)
+        else:
+            raise SyncError(f"Missing source file: {src}") from exc
     dir_fd: int | None = None
     try:
         st = os.fstat(src_fd)
