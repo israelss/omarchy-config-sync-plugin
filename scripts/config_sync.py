@@ -4249,14 +4249,15 @@ def _launch_command_in_terminal(cmd: list[str]) -> bool:
     Used when a command needs interactive input (e.g. sudo password prompt)
     that a background subprocess cannot provide."""
     devnull = subprocess.DEVNULL
-    shell_cmd = " ".join(shlex.quote(c) for c in cmd)
+    env = os.environ.copy()
 
     if shutil.which("uwsm-app") and shutil.which("xdg-terminal-exec"):
         try:
             subprocess.Popen(
-                ["uwsm-app", "--", "xdg-terminal-exec", "-e", shell_cmd],
+                ["uwsm-app", "--", "xdg-terminal-exec", "-e"] + cmd,
                 start_new_session=True,
                 stdin=devnull, stdout=devnull, stderr=devnull, close_fds=True,
+                env=env,
             )
             return True
         except OSError:
@@ -4265,19 +4266,22 @@ def _launch_command_in_terminal(cmd: list[str]) -> bool:
     if shutil.which("xdg-terminal-exec"):
         try:
             subprocess.Popen(
-                ["xdg-terminal-exec", "-e", shell_cmd],
+                ["xdg-terminal-exec", "-e"] + cmd,
                 start_new_session=True,
                 stdin=devnull, stdout=devnull, stderr=devnull, close_fds=True,
+                env=env,
             )
             return True
         except OSError:
             pass
 
+    # Try footclient first (connects to running foot server), then foot -e
     for term, args in [
-        ("foot", ["foot", "-e", shell_cmd]),
-        ("ghostty", ["ghostty", "-e", shell_cmd]),
-        ("alacritty", ["alacritty", "-e", shell_cmd]),
-        ("kitty", ["kitty", shell_cmd]),
+        ("foot", ["footclient", "-e"] + cmd),
+        ("foot", ["foot", "-e"] + cmd),
+        ("ghostty", ["ghostty", "-e"] + cmd),
+        ("alacritty", ["alacritty", "-e"] + cmd),
+        ("kitty", ["kitty"] + cmd),
     ]:
         if shutil.which(term):
             try:
@@ -4285,6 +4289,7 @@ def _launch_command_in_terminal(cmd: list[str]) -> bool:
                     args,
                     start_new_session=True,
                     stdin=devnull, stdout=devnull, stderr=devnull, close_fds=True,
+                    env=env,
                 )
                 return True
             except OSError:
