@@ -523,8 +523,8 @@ class InspectAndSyncTests(unittest.TestCase):
             self.assertEqual(kept.get("note"), "keep-me")
             self.assertTrue(Path(applied["backup_dir"]).is_dir())
 
-            # Plugins/bin run code, so they require a separate explicit opt-in apply
-            # rather than landing via the default (unselected) Apply above.
+            # Plugins/bin run code, so a bare CLI/panel Apply skips them unless they
+            # are explicitly selected below.
             bundle_applied = cs.cmd_apply(
                 env.ctx,
                 argparse_ns(explicit=True, files="bin/useful-tool", plugin=["demo.widget"]),
@@ -1249,12 +1249,30 @@ class SecurityHardeningTests(unittest.TestCase):
         for cmd in seen_argv:
             self.assertNotIn("supersecrettoken", " ".join(cmd))
 
-    def test_plugin_groups_never_default_apply_incoming(self) -> None:
-        for status in ("added-repo", "repo", "differs", "both"):
-            files = [{"path": "plugins/evil.plugin/Panel.qml", "status": status}]
+    def test_plugin_groups_default_apply_incoming(self) -> None:
+        # Plugins are the user's own trusted code and restore on a fresh
+        # machine, so incoming (non-removal) plugins come pre-checked for Apply.
+        for status in ("repo", "added-repo"):
+            files = [{"path": "plugins/good.plugin/Panel.qml", "status": status}]
             groups = cs.plugin_groups(files)
             self.assertEqual(len(groups), 1)
-            self.assertFalse(groups[0]["default_apply"], f"status={status} must not default-apply a plugin")
+            self.assertTrue(groups[0]["default_apply"], f"status={status} must default-apply a plugin")
+            self.assertFalse(groups[0]["default_publish"], f"status={status} is incoming only")
+        # A change in both directions can be applied or published; both stay checked.
+        files = [{"path": "plugins/good.plugin/Panel.qml", "status": "differs"}]
+        groups = cs.plugin_groups(files)
+        self.assertTrue(groups[0]["default_apply"])
+        self.assertTrue(groups[0]["default_publish"])
+        # A change on both sides or a deletion must never be swept up blindly.
+        for status in ("both", "local", "added-local"):
+            files = [{"path": "plugins/good.plugin/Panel.qml", "status": status}]
+            groups = cs.plugin_groups(files)
+            self.assertEqual(len(groups), 1)
+            self.assertFalse(groups[0]["default_apply"], f"status={status} must not default-apply")
+        removal = [{"path": "plugins/good.plugin/Panel.qml", "status": "repo", "removal": True}]
+        groups = cs.plugin_groups(removal)
+        self.assertFalse(groups[0]["default_apply"], "a deletion is never checked for you")
+        self.assertFalse(groups[0]["default_publish"])
 
     def test_file_bundles_never_default_apply_incoming(self) -> None:
         paths = [

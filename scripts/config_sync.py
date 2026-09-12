@@ -2399,8 +2399,10 @@ def plugin_groups(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "file_count": len(g["files"]),
                 "changed_count": len(statuses),
                 "git_managed": g["git_managed"],
-                # Plugins carry executable code; incoming ones require explicit opt-in, never a default-checked Apply.
-                "default_apply": False,
+                # Plugins are the user's own trusted code; they restore on a
+                # fresh machine by default. Run-once helpers (hooks, agents,
+                # bin, extensions) still require explicit opt-in.
+                "default_apply": status in {"repo", "added-repo", "differs"} and not removal,
                 "default_publish": status in {"local", "added-local", "differs", "both"} and not removal,
             }
         )
@@ -2487,9 +2489,11 @@ def file_bundles(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "removal": removal,
                 "files": [p for p, s in zip(b["files"], b["statuses"]) if s not in {"identical", "machine"}],
                 "changed_count": n,
-                # Hooks/agents/branding/extensions/bin run code or steer an agent;
-                # incoming bundles require explicit opt-in, never a default-checked Apply.
-                "default_apply": False,
+                # Plugins are the user's own trusted code; they restore on a
+                # fresh machine by default. Hooks/agents/branding/extensions/bin
+                # run code or steer an agent, so those bundles still require an
+                # explicit opt-in, never a default-checked Apply.
+                "default_apply": b["kind"] == "plugin" and status in {"repo", "added-repo", "differs"} and not removal,
                 "default_publish": status in {"local", "added-local", "differs"} and not removal,
             }
         )

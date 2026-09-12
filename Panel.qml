@@ -267,8 +267,7 @@ Panel {
     for (i = 0; i < bundleDiffs.length; i++) {
       item = bundleDiffs[i]
       key = pickId("g", item.id)
-      // Hooks/agents/branding/extensions/bin run code or steer an agent: same rule as plugins.
-      next[key] = (key in picks) ? picks[key] : !!item.default_publish
+      next[key] = (key in picks) ? picks[key] : !!(item.default_apply || item.default_publish)
     }
     if (themeDiff) {
       key = pickId("t", "selected")
