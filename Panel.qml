@@ -678,6 +678,29 @@ Panel {
     })
   }
 
+  function pollPackages() {
+    if (pkgProc.running) return
+    pkgProc.command = ["python3", "-u", root.scriptPath, "packages"]
+    pkgProc.running = true
+  }
+
+  function handlePackagesOutput(text) {
+    var raw = String(text || "").trim()
+    if (!raw) return
+    var data
+    try {
+      data = JSON.parse(raw)
+    } catch (e) {
+      return
+    }
+    if (!data || !data.ok || !data.packages) return
+    status = Object.assign({}, status, { packages: data.packages })
+    if (data.pkg_notice && !notifyProc.running) {
+      notifyProc.command = ["omarchy-notification-send", "--app-name", "Config Sync", "Packages changed", String(data.pkg_notice)]
+      notifyProc.running = true
+    }
+  }
+
   function run(args, stdinData) {
     if (syncProc.running) {
       pendingArgs = args
@@ -757,6 +780,32 @@ Panel {
     running: true
     repeat: true
     onTriggered: if (!root.busy) root.refresh(true)
+  }
+
+  // Background package watch: the pacman hook deletes the generated lists
+  // after every transaction, so a cheap drift check here notices installs
+  // and removals made in a terminal without opening the panel. Counts merge
+  // into status; a delta triggers one desktop notification.
+  Timer {
+    interval: 60 * 1000
+    running: true
+    repeat: true
+    onTriggered: if (!root.opened && !root.busy && root.status && root.status.configured) root.pollPackages()
+  }
+
+  Process {
+    id: pkgProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.handlePackagesOutput(text)
+    }
+    stderr: StdioCollector { waitForEnd: true }
+  }
+
+  Process {
+    id: notifyProc
+    stdout: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { waitForEnd: true }
   }
 
   Process {

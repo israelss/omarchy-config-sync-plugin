@@ -1648,6 +1648,57 @@ def pacman_hook_state() -> dict[str, Any]:
     }
 
 
+def pkg_count_baseline(ctx: Context, repo: Path) -> dict[str, int]:
+    """Current (missing, unsynced) package counts for change detection."""
+    counts = package_drift(ctx, repo).get("counts") or {}
+    return {"missing": int(counts.get("missing") or 0), "unsynced": int(counts.get("unsynced") or 0)}
+
+
+def cmd_packages(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
+    """Lightweight package-drift check for background polling.
+
+    No git traffic, no inventory walk: just the package lists (regenerated
+    when the pacman hook flushed the cache). Compares against the last
+    counts stored in state.json; the first run only seeds the baseline.
+    The panel polls this while closed so installs/removals made in a
+    terminal are noticed without opening the plugin."""
+    state = load_state(ctx)
+    try:
+        repo = configured_repo(ctx, state)
+    except SyncError:
+        repo = None
+    if repo is None:
+        return ok(
+            {
+                "packages": {
+                    "tracked": ctx.track_packages,
+                    "live": {"repo": 0, "aur": 0},
+                    "captured": {"repo": 0, "aur": 0},
+                    "missing": {"repo": [], "aur": []},
+                    "unsynced": {"repo": [], "aur": []},
+                    "counts": {"missing": 0, "unsynced": 0},
+                },
+                "pkg_changed": False,
+                "pkg_notice": None,
+            }
+        )
+    drift = package_drift(ctx, repo)
+    counts = pkg_count_baseline(ctx, repo)
+    prev = state.get("last_pkg_counts")
+    changed = bool(prev) and prev != counts
+    if prev != counts:
+        state["last_pkg_counts"] = counts
+        save_state(ctx, state)
+    notice = None
+    if changed:
+        notice = (
+            f"{counts['unsynced']} package(s) installed here but not in the repo, "
+            f"{counts['missing']} repo package(s) missing here. "
+            "Open Config Sync to review."
+        )
+    return ok({"packages": drift, "pkg_changed": changed, "pkg_notice": notice})
+
+
 def cmd_pacman_hook(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     """Verify, install, or remove the pacman hook from the panel.
 
@@ -3805,6 +3856,9 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     state["file_hashes"] = hashes
     state["last_apply_at"] = now_iso()
     state["last_applied_commit"] = git_fields.get("head_full") or git_out(repo, "rev-parse", "HEAD")
+    # Seed the package baseline so the background watcher does not report
+    # this Apply's own installs as an external change.
+    state["last_pkg_counts"] = pkg_count_baseline(ctx, repo)
     save_state(ctx, state)
 
     # When the install was launched in a visible terminal the user must enter a
@@ -4027,6 +4081,9 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         hashes.pop(rel, None)
     state["file_hashes"] = hashes
     state["last_publish_at"] = now_iso()
+    # Publishing rewrites the repo lists, which moves the drift counts; seed
+    # the baseline so the background watcher stays quiet about our own change.
+    state["last_pkg_counts"] = pkg_count_baseline(ctx, repo)
     save_state(ctx, state)
     snap = build_snapshot(ctx, fetch=False)
     snap["published"] = published
@@ -4575,6 +4632,7 @@ def build_parser() -> argparse.ArgumentParser:
             "open",
             "terminal",
             "pacman-hook",
+            "packages",
         ],
     )
     parser.add_argument("args", nargs="*")
@@ -4631,6 +4689,8 @@ def dispatch(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         return cmd_terminal(ctx, args)
     if command == "pacman-hook":
         return cmd_pacman_hook(ctx, args)
+    if command == "packages":
+        return cmd_packages(ctx, args)
     raise SyncError(f"Unknown command: {command}")
 
 

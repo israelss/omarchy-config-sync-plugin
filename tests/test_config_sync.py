@@ -2791,6 +2791,10 @@ class PackageTests(unittest.TestCase):
 
 
 class PacmanHookTests(unittest.TestCase):
+    # Reuse the package-mocking helper: the poll tests live here because the
+    # background watch pairs with the hook (its cache flush is the signal).
+    _pkg_context = PackageTests._pkg_context
+
     def test_status_reports_missing_hook_and_persists(self) -> None:
         """With no hook file, status reports not-installed and stores the
         last known state so the panel can show it until the next check."""
@@ -2861,6 +2865,120 @@ class PacmanHookTests(unittest.TestCase):
                 with self.assertRaises(cs.SyncError) as raised:
                     cs.cmd_pacman_hook(env.ctx, argparse_ns(args=["install"]))
             self.assertIn("pacman-hook.sh install", str(raised.exception))
+
+    def test_packages_poll_first_run_seeds_baseline_quietly(self) -> None:
+        """The first poll stores the counts without reporting a change, so a
+        fresh baseline never spams a notification."""
+        with TempHome() as env:
+            env.ctx.track_packages = True
+            repo = make_config_repo(env.home / "cfg")
+            write(repo / "pkg-repo.txt", "brave\nvim-gtk\n")
+            commit_all(repo, "track packages")
+            with self._pkg_context(
+                explicit_repo=["firefox", "vim-gtk"],
+                explicit_aur=[],
+                installed=["firefox", "vim-gtk", "glibc"],
+                default_names=["firefox", "glibc"],
+            ):
+                cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+                res = cs.cmd_packages(env.ctx, argparse_ns())
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["packages"]["counts"], {"missing": 1, "unsynced": 0})
+            self.assertFalse(res["pkg_changed"])
+            self.assertIsNone(res["pkg_notice"])
+            self.assertEqual(cs.load_state(env.ctx)["last_pkg_counts"], {"missing": 1, "unsynced": 0})
+
+    def test_packages_poll_reports_external_install_once(self) -> None:
+        """A package installed in a terminal (hook flushed the cache) shows up
+        as a change exactly once, then becomes the new baseline."""
+        with TempHome() as env:
+            env.ctx.track_packages = True
+            repo = make_config_repo(env.home / "cfg")
+            write(repo / "pkg-repo.txt", "brave\nvim-gtk\n")
+            commit_all(repo, "track packages")
+            with self._pkg_context(
+                explicit_repo=["firefox", "vim-gtk"],
+                explicit_aur=[],
+                installed=["firefox", "vim-gtk", "glibc"],
+                default_names=["firefox", "glibc"],
+            ):
+                cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+                cs.cmd_packages(env.ctx, argparse_ns())
+                with self._pkg_context(
+                    explicit_repo=["firefox", "vim-gtk", "brave", "htop"],
+                    explicit_aur=[],
+                    installed=["firefox", "vim-gtk", "brave", "htop", "glibc"],
+                    default_names=["firefox", "glibc"],
+                ):
+                    cs.flush_live_pkg_cache(env.ctx)
+                    res = cs.cmd_packages(env.ctx, argparse_ns())
+                    self.assertTrue(res["pkg_changed"])
+                    self.assertIn("1 package(s) installed here", res["pkg_notice"])
+                    self.assertEqual(res["packages"]["counts"], {"missing": 0, "unsynced": 1})
+                    again = cs.cmd_packages(env.ctx, argparse_ns())
+                    self.assertFalse(again["pkg_changed"])
+                    self.assertIsNone(again["pkg_notice"])
+
+    def test_packages_poll_reports_external_removal(self) -> None:
+        """A package removed in a terminal grows the missing count."""
+        with TempHome() as env:
+            env.ctx.track_packages = True
+            repo = make_config_repo(env.home / "cfg")
+            write(repo / "pkg-repo.txt", "brave\nvim-gtk\n")
+            commit_all(repo, "track packages")
+            with self._pkg_context(
+                explicit_repo=["firefox", "vim-gtk"],
+                explicit_aur=[],
+                installed=["firefox", "vim-gtk", "glibc"],
+                default_names=["firefox", "glibc"],
+            ):
+                cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+                cs.cmd_packages(env.ctx, argparse_ns())
+                with self._pkg_context(
+                    explicit_repo=["firefox"],
+                    explicit_aur=[],
+                    installed=["firefox", "glibc"],
+                    default_names=["firefox", "glibc"],
+                ):
+                    cs.flush_live_pkg_cache(env.ctx)
+                    res = cs.cmd_packages(env.ctx, argparse_ns())
+                    self.assertTrue(res["pkg_changed"])
+                    self.assertIn("2 repo package(s) missing", res["pkg_notice"])
+
+    def test_packages_poll_unconfigured_returns_zeros(self) -> None:
+        """Without a linked repo the poll is a harmless no-op."""
+        with TempHome() as env:
+            res = cs.cmd_packages(env.ctx, argparse_ns())
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["packages"]["counts"], {"missing": 0, "unsynced": 0})
+            self.assertFalse(res["pkg_changed"])
+
+    def test_apply_seeds_baseline_so_poll_stays_quiet(self) -> None:
+        """Apply stores the post-apply counts, so the background poll does not
+        report the panel's own work as an external change."""
+        with TempHome() as env:
+            env.ctx.track_packages = True
+            repo = make_config_repo(env.home / "cfg")
+            write(repo / "pkg-repo.txt", "brave\nvim-gtk\n")
+            commit_all(repo, "track packages")
+            with self._pkg_context(
+                explicit_repo=["firefox", "vim-gtk"],
+                explicit_aur=[],
+                installed=["firefox", "vim-gtk", "glibc"],
+                default_names=["firefox", "glibc"],
+            ):
+                cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+                cs.cmd_packages(env.ctx, argparse_ns())
+                with self._pkg_context(
+                    explicit_repo=["firefox", "vim-gtk", "brave"],
+                    explicit_aur=[],
+                    installed=["firefox", "vim-gtk", "brave", "glibc"],
+                    default_names=["firefox", "glibc"],
+                ):
+                    cs.flush_live_pkg_cache(env.ctx)
+                    cs.cmd_apply(env.ctx, argparse_ns(explicit=True, files="pkg-repo.txt", install_packages=True))
+                    res = cs.cmd_packages(env.ctx, argparse_ns())
+                    self.assertFalse(res["pkg_changed"])
 
     def test_snapshot_carries_hook_state(self) -> None:
         """Every snapshot exposes the hook state so the Configs tab can
