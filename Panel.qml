@@ -1225,7 +1225,7 @@ Panel {
                 enabled: root.missingPkgCount > 0
                 foreground: root.foreground
                 accent: root.accent
-                onToggled: root.installPackages = checked
+                onToggled: root.installPackages = !root.installPackages
               }
             }
 
