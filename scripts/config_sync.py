@@ -1554,6 +1554,7 @@ def install_missing_packages(ctx: Context, repo: Path, *, dry_run: bool = False)
         result["failed"] = [p for _, pkgs in pending for p in pkgs]
         result["message"] = "package install skipped: omarchy command not found."
         return result
+    installed_any = False
     for kind, pkgs in pending:
         args = [omarchy, "pkg", "add", *pkgs] if kind == "repo" else [omarchy, "pkg", "aur", "add", *pkgs]
         try:
@@ -1564,6 +1565,7 @@ def install_missing_packages(ctx: Context, repo: Path, *, dry_run: bool = False)
             continue
         if proc.returncode == 0:
             result["installed"] += pkgs
+            installed_any = True
         else:
             result["failed"] += pkgs
             detail = (proc.stderr or proc.stdout or "").strip().splitlines()
@@ -1571,6 +1573,12 @@ def install_missing_packages(ctx: Context, repo: Path, *, dry_run: bool = False)
                 (result["message"] + " " if result["message"] else "")
                 + f"{kind} install failed ({proc.returncode}): {detail[-1] if detail else 'see omarchy output'}"
             ).strip()
+    if installed_any:
+        # The machine changed under us: drop the generated lists so the snapshot
+        # taken right after Apply regenerates them from the live package DB. The
+        # pacman PostTransaction hook would do this too, but a hook may lag
+        # behind the panel's reload, or not be installed at all on this box.
+        flush_live_pkg_cache(ctx)
     if not result["failed"]:
         result["message"] = f"Installed {len(result['installed'])} package{'s' if len(result['installed']) != 1 else ''}."
     return result

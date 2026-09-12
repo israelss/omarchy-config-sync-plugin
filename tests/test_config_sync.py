@@ -2600,6 +2600,79 @@ class PackageTests(unittest.TestCase):
                 self.assertEqual(pkgs["counts"]["missing"], 1)
                 self.assertEqual(pkgs["missing"], {"repo": ["vim-gtk"], "aur": []})
 
+    def test_install_packages_flushes_cache_so_next_snapshot_settles(self) -> None:
+        """A successful install drops the generated pkg lists so the next
+        snapshot regenerates them from the live package DB; the repo's pkg-*.
+        txt then stop lingering as incoming files once this machine actually
+        carries the listed packages."""
+        with TempHome() as env:
+            env.ctx.track_packages = True
+            repo = make_config_repo(env.home / "cfg")
+            write(repo / "pkg-repo.txt", "brave\nvim-gtk\n")
+            write(repo / "pkg-aur.txt", "paru\n")
+            commit_all(repo, "track packages")
+            calls: list[list[str]] = []
+            with self._pkg_context(
+                explicit_repo=["firefox"],
+                explicit_aur=[],
+                installed=["firefox", "glibc"],
+                default_names=["glibc"],
+                calls_out=calls,
+            ):
+                cache = cs.live_pkg_files(env.ctx, force=True)
+                self.assertTrue(cache[cs.PKG_INSTALLED_REL].exists())
+                result = cs.install_missing_packages(env.ctx, repo)
+                self.assertEqual(result["installed"], ["brave", "vim-gtk", "paru"])
+                self.assertEqual(
+                    self._omarchy_calls(calls),
+                    [
+                        ["/usr/bin/omarchy", "pkg", "add", "brave", "vim-gtk"],
+                        ["/usr/bin/omarchy", "pkg", "aur", "add", "paru"],
+                    ],
+                )
+                # The pre-install lists are dropped right after a successful
+                # install so the next snapshot refreshes them from the live DB.
+                self.assertFalse(cache[cs.PKG_INSTALLED_REL].exists())
+                self.assertFalse(cache[cs.PKG_REPO_REL].exists())
+                self.assertFalse(cache[cs.PKG_AUR_REL].exists())
+                # The machine now carries the listed packages: a fresh snapshot
+                # regenerates the lists and pkg-*.txt settle to identical.
+                with self._pkg_context(
+                    explicit_repo=["brave", "vim-gtk", "firefox"],
+                    explicit_aur=["paru"],
+                    installed=["brave", "vim-gtk", "paru", "firefox", "glibc"],
+                    default_names=["firefox", "glibc"],
+                ):
+                    cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+                    snap = cs.cmd_snapshot(env.ctx, argparse_ns(fetch=False))
+                    by = {f["path"]: f for f in snap["diff"]["files"]}
+                    self.assertEqual(by[cs.PKG_REPO_REL]["status"], "identical")
+                    self.assertEqual(by[cs.PKG_AUR_REL]["status"], "identical")
+                    self.assertEqual(snap["status"]["packages"]["counts"]["missing"], 0)
+
+    def test_install_packages_noop_keeps_cache(self) -> None:
+        """When nothing is missing, install has no side effects: the generated
+        lists are left alone so a zero-work apply does not hammer pacman."""
+        with TempHome() as env:
+            env.ctx.track_packages = True
+            repo = make_config_repo(env.home / "cfg")
+            write(repo / "pkg-repo.txt", "brave\n")
+            commit_all(repo, "track packages")
+            calls: list[list[str]] = []
+            with self._pkg_context(
+                explicit_repo=["brave", "firefox"],
+                explicit_aur=[],
+                installed=["brave", "firefox", "glibc"],
+                default_names=["firefox", "glibc"],
+                calls_out=calls,
+            ):
+                cache = cs.live_pkg_files(env.ctx, force=True)
+                result = cs.install_missing_packages(env.ctx, repo)
+                self.assertEqual(result["installed"], [])
+                self.assertEqual(self._omarchy_calls(calls), [])
+                self.assertTrue(cache[cs.PKG_REPO_REL].exists())
+                self.assertTrue(cache[cs.PKG_INSTALLED_REL].exists())
+
     def test_summarize_file_diff_describes_package_changes(self) -> None:
         with TempHome() as env:
             env.ctx.track_packages = True
