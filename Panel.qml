@@ -1161,11 +1161,9 @@ Panel {
 
           Column {
             id: confirmCol
-            anchors.left: parent.left
-            anchors.right: parent.right
+            width: parent.width - Style.space(32)
+            anchors.horizontalCenter: parent.horizontalCenter
             anchors.verticalCenter: parent.verticalCenter
-            anchors.leftMargin: Style.space(16)
-            anchors.rightMargin: Style.space(16)
             spacing: Style.space(12)
 
             Text {
