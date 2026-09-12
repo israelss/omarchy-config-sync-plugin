@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "israelss.gladimdim.config-sync",
   "name": "Omarchy Config Sync",
-  "version": "1.2.25",
+  "version": "1.2.26",
   "author": "Dmytro Gladkyi | Israel Sant'Anna",
   "license": "MIT",
   "description": "Seamlessly sync all your Omarchy configurations, shortcuts, themes, and plugins between your machines.",
