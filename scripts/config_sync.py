@@ -3939,6 +3939,10 @@ def cmd_resync(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         args=[],
         command="apply",
         url=None,
+        # The second-machine case ("Take repo") is the restore path: installing
+        # the packages the repo lists is part of matching the repo, not a
+        # surprise side effect the user must discover in the Apply dialog.
+        install_packages=side == "repo",
     )
 
     if side == "repo":

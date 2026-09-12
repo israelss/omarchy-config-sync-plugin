@@ -1178,7 +1178,7 @@ Panel {
                   : root.confirmKind === "switch-repo"
                     ? "Point this machine at a different git repo? Local files are not deleted. The new repo is cloned and checked before anything is applied."
                     : root.confirmKind === "resync-repo"
-                      ? "Make this machine match the git repo? Incoming plugins, shortcuts, theme, and configs overwrite local copies. A timestamped backup is written first. Extra files that exist only on this machine are left in place."
+                      ? "Make this machine match the git repo? Incoming plugins, shortcuts, theme, and configs overwrite local copies, and packages the repo lists that are missing here are installed. A timestamped backup is written first. Extra files that exist only on this machine are left in place."
                       : root.confirmKind === "resync-local"
                         ? "Overwrite the git repo with this machine's config, then push?"
                         : "Unlink the config repo on this machine? Local files are left as they are."
