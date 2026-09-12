@@ -2404,6 +2404,7 @@ class PackageTests(unittest.TestCase):
         stack.enter_context(patch.object(cs, "_pacman_query", side_effect=query))
         stack.enter_context(patch.object(cs.shutil, "which", side_effect=which))
         stack.enter_context(patch.object(cs, "OMARCHY_PKG_DIR", str(defaults_dir)))
+        stack.enter_context(patch.object(cs, "_can_sudo", return_value=True))
         if capture_install:
             stack.enter_context(patch.object(cs, "run_bounded", side_effect=bounded))
         self.addCleanup(stack.close)
@@ -2708,6 +2709,64 @@ class PackageTests(unittest.TestCase):
                     repo_within=repo,
                 )
                 self.assertIn("no package difference", summary_same)
+
+    def test_apply_launches_terminal_when_sudo_unavailable(self) -> None:
+        """When passwordless sudo is not configured, the install is opened in
+        a visible terminal so the user can enter their password interactively."""
+        with TempHome() as env:
+            env.ctx.track_packages = True
+            repo = make_config_repo(env.home / "cfg")
+            write(repo / "pkg-repo.txt", "brave\n")
+            write(repo / "pkg-aur.txt", "paru\n")
+            commit_all(repo, "track packages")
+            launched_cmds: list[list[str]] = []
+            with self._pkg_context(
+                explicit_repo=["firefox"],
+                explicit_aur=[],
+                installed=["firefox", "glibc"],
+                default_names=["firefox", "glibc"],
+            ):
+                cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+                original_launch = cs._launch_command_in_terminal
+
+                def capture_launch(cmd: list[str]) -> bool:
+                    launched_cmds.append(cmd)
+                    return True
+
+                with patch.object(cs, "_launch_command_in_terminal", side_effect=capture_launch):
+                    with patch.object(cs, "_can_sudo", return_value=False):
+                        res = cs.cmd_apply(env.ctx, argparse_ns(explicit=True, files="pkg-repo.txt,pkg-aur.txt", install_packages=True))
+                self.assertEqual(len(launched_cmds), 1)
+                script = launched_cmds[0][-1]  # the /bin/sh -c "..." arg
+                self.assertIn("omarchy pkg add brave", script)
+                self.assertIn("omarchy pkg aur add paru", script)
+                self.assertTrue(res["packages"].get("launched"))
+                self.assertIn("terminal", res["message"].lower())
+                # reload_desktop must NOT have been called (no shell restart).
+                self.assertNotIn("reload", res)
+
+    def test_apply_falls_back_to_subprocess_when_terminal_unavailable(self) -> None:
+        """If no terminal emulator is found, the install falls back to the
+        subprocess path (which may still fail on sudo, but at least tries)."""
+        with TempHome() as env:
+            env.ctx.track_packages = True
+            repo = make_config_repo(env.home / "cfg")
+            write(repo / "pkg-repo.txt", "brave\n")
+            commit_all(repo, "track packages")
+            calls: list[list[str]] = []
+            with self._pkg_context(
+                explicit_repo=["firefox"],
+                explicit_aur=[],
+                installed=["firefox", "glibc"],
+                default_names=["firefox", "glibc"],
+                calls_out=calls,
+            ):
+                cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+                with patch.object(cs, "_launch_command_in_terminal", return_value=False):
+                    with patch.object(cs, "_can_sudo", return_value=False):
+                        res = cs.cmd_apply(env.ctx, argparse_ns(explicit=True, files="pkg-repo.txt", install_packages=True))
+                # Falls back to subprocess — which succeeds in the mock.
+                self.assertEqual(res["packages"]["installed"], ["brave"])
 
 
 class PluginVersionTests(unittest.TestCase):

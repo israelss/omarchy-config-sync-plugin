@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -1517,13 +1518,24 @@ def package_drift(ctx: Context, repo: Path) -> dict[str, Any]:
     return base
 
 
-def install_missing_packages(ctx: Context, repo: Path, *, dry_run: bool = False) -> dict[str, Any]:
+def install_missing_packages(
+    ctx: Context,
+    repo: Path,
+    *,
+    dry_run: bool = False,
+    launch_in_terminal: bool = False,
+) -> dict[str, Any]:
     """Install packages the repo's pkg-*.txt lists that this machine lacks.
 
     Gated on --install-packages so Apply never silently runs pacman. Returns a
     report the snapshot carries; a failed install is recorded, not fatal, so the
     rest of Apply still lands (the user can retry from a terminal, where pacman
-    can prompt for sudo)."""
+    can prompt for sudo).
+
+    When *launch_in_terminal* is True and there are packages to install, the
+    install is opened in a visible terminal so the user can enter a sudo
+    password.  The function returns immediately with ``launched: True`` and the
+    caller must skip ``reload_desktop()`` because the install is asynchronous."""
     result: dict[str, Any] = {
         "tracked": ctx.track_packages,
         "installed": [],
@@ -1554,33 +1566,55 @@ def install_missing_packages(ctx: Context, repo: Path, *, dry_run: bool = False)
         result["failed"] = [p for _, pkgs in pending for p in pkgs]
         result["message"] = "package install skipped: omarchy command not found."
         return result
-    installed_any = False
-    for kind, pkgs in pending:
-        args = [omarchy, "pkg", "add", *pkgs] if kind == "repo" else [omarchy, "pkg", "aur", "add", *pkgs]
-        try:
-            proc = run_bounded(args, timeout=PKG_INSTALL_TIMEOUT, max_bytes=MAX_SUBPROCESS_BYTES)
-        except subprocess.TimeoutExpired:
-            result["failed"] += pkgs
-            result["message"] = (result["message"] + f" AUR install timed out after {PKG_INSTALL_TIMEOUT}s.").strip()
-            continue
-        if proc.returncode == 0:
-            result["installed"] += pkgs
-            installed_any = True
-        else:
-            result["failed"] += pkgs
-            detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+    if launch_in_terminal:
+        all_pkgs = [p for _, pkgs in pending for p in pkgs]
+        cmds: list[str] = []
+        for kind, pkgs in pending:
+            if kind == "repo":
+                cmds.append(f"{omarchy} pkg add {' '.join(shlex.quote(p) for p in pkgs)}")
+            else:
+                cmds.append(f"{omarchy} pkg aur add {' '.join(shlex.quote(p) for p in pkgs)}")
+        shell_cmd = " && ".join(cmds)
+        terminal_cmd = f"echo 'Installing {len(all_pkgs)} package(s)…' && {shell_cmd} && echo 'Done. You can close this window.' || echo 'Install failed — check the output above.'; sleep 5"
+        launched = _launch_command_in_terminal(["/bin/sh", "-c", terminal_cmd])
+        if launched:
+            result["launched"] = True
+            total = len(all_pkgs)
             result["message"] = (
-                (result["message"] + " " if result["message"] else "")
-                + f"{kind} install failed ({proc.returncode}): {detail[-1] if detail else 'see omarchy output'}"
-            ).strip()
-    if installed_any:
-        # The machine changed under us: drop the generated lists so the snapshot
-        # taken right after Apply regenerates them from the live package DB. The
-        # pacman PostTransaction hook would do this too, but a hook may lag
-        # behind the panel's reload, or not be installed at all on this box.
-        flush_live_pkg_cache(ctx)
-    if not result["failed"]:
-        result["message"] = f"Installed {len(result['installed'])} package{'s' if len(result['installed']) != 1 else ''}."
+                f"Launched install of {total} package{'s' if total != 1 else ''} in a terminal. "
+                "Enter your sudo password there to proceed."
+            )
+        else:
+            # Fallback: try the subprocess path even though it may fail on sudo.
+            launch_in_terminal = False
+    if not launch_in_terminal:
+        installed_any = False
+        for kind, pkgs in pending:
+            args = [omarchy, "pkg", "add", *pkgs] if kind == "repo" else [omarchy, "pkg", "aur", "add", *pkgs]
+            try:
+                proc = run_bounded(args, timeout=PKG_INSTALL_TIMEOUT, max_bytes=MAX_SUBPROCESS_BYTES)
+            except subprocess.TimeoutExpired:
+                result["failed"] += pkgs
+                result["message"] = (result["message"] + f" AUR install timed out after {PKG_INSTALL_TIMEOUT}s.").strip()
+                continue
+            if proc.returncode == 0:
+                result["installed"] += pkgs
+                installed_any = True
+            else:
+                result["failed"] += pkgs
+                detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+                result["message"] = (
+                    (result["message"] + " " if result["message"] else "")
+                    + f"{kind} install failed ({proc.returncode}): {detail[-1] if detail else 'see omarchy output'}"
+                ).strip()
+        if installed_any:
+            # The machine changed under us: drop the generated lists so the snapshot
+            # taken right after Apply regenerates them from the live package DB. The
+            # pacman PostTransaction hook would do this too, but a hook may lag
+            # behind the panel's reload, or not be installed at all on this box.
+            flush_live_pkg_cache(ctx)
+        if not result["failed"]:
+            result["message"] = f"Installed {len(result['installed'])} package{'s' if len(result['installed']) != 1 else ''}."
     return result
 
 
@@ -3673,7 +3707,11 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
 
     pkg_result = {}
     if pkg_wanted:
-        pkg_result = install_missing_packages(ctx, repo, dry_run=False)
+        # When the user lacks passwordless sudo, omarchy pkg add hangs in a
+        # subprocess (no TTY for the password prompt).  Launch in a visible
+        # terminal instead so the user can authenticate interactively.
+        use_terminal = not _can_sudo()
+        pkg_result = install_missing_packages(ctx, repo, dry_run=False, launch_in_terminal=use_terminal)
 
     # Refresh hashes for every tracked file after apply.
     post = collect_inventory(ctx, repo)
@@ -3696,6 +3734,19 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     state["last_apply_at"] = now_iso()
     state["last_applied_commit"] = git_fields.get("head_full") or git_out(repo, "rev-parse", "HEAD")
     save_state(ctx, state)
+
+    # When the install was launched in a visible terminal the user must enter a
+    # sudo password interactively.  Skip reload_desktop() — the shell already
+    # picked up the file changes, and the package install is asynchronous.
+    if pkg_result.get("launched"):
+        snap = build_snapshot(ctx, fetch=False)
+        snap["applied"] = applied
+        snap["backup_dir"] = str(backup_dir)
+        snap["packages"] = {**package_drift(ctx, repo), **pkg_result}
+        snap["message"] = pkg_result.get("message") or "Install launched in a terminal."
+        snap["removed"] = removed
+        return snap
+
     notes = {}
     if not args.dry_run:
         notes = reload_desktop()
@@ -4190,6 +4241,68 @@ def cmd_open(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
 
     success = open_in_file_manager(target)
     return ok({"opened": str(target), "success": success})
+
+
+def _launch_command_in_terminal(cmd: list[str]) -> bool:
+    """Open a terminal window and run *cmd* inside it.
+
+    Used when a command needs interactive input (e.g. sudo password prompt)
+    that a background subprocess cannot provide."""
+    devnull = subprocess.DEVNULL
+    shell_cmd = " ".join(shlex.quote(c) for c in cmd)
+
+    if shutil.which("uwsm-app") and shutil.which("xdg-terminal-exec"):
+        try:
+            subprocess.Popen(
+                ["uwsm-app", "--", "xdg-terminal-exec", "-e", shell_cmd],
+                start_new_session=True,
+                stdin=devnull, stdout=devnull, stderr=devnull, close_fds=True,
+            )
+            return True
+        except OSError:
+            pass
+
+    if shutil.which("xdg-terminal-exec"):
+        try:
+            subprocess.Popen(
+                ["xdg-terminal-exec", "-e", shell_cmd],
+                start_new_session=True,
+                stdin=devnull, stdout=devnull, stderr=devnull, close_fds=True,
+            )
+            return True
+        except OSError:
+            pass
+
+    for term, args in [
+        ("foot", ["foot", "-e", shell_cmd]),
+        ("ghostty", ["ghostty", "-e", shell_cmd]),
+        ("alacritty", ["alacritty", "-e", shell_cmd]),
+        ("kitty", ["kitty", shell_cmd]),
+    ]:
+        if shutil.which(term):
+            try:
+                subprocess.Popen(
+                    args,
+                    start_new_session=True,
+                    stdin=devnull, stdout=devnull, stderr=devnull, close_fds=True,
+                )
+                return True
+            except OSError:
+                pass
+
+    return False
+
+
+def _can_sudo() -> bool:
+    """Return True if the current user can ``sudo`` without a password prompt."""
+    sudo = shutil.which("sudo")
+    if not sudo:
+        return False
+    try:
+        proc = run_bounded([sudo, "-n", "true"], timeout=5, max_bytes=4096)
+        return proc.returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
 
 
 def open_in_terminal(target_path: str | Path) -> bool:
