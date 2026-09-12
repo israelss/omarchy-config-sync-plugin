@@ -2732,7 +2732,7 @@ class PackageTests(unittest.TestCase):
                     launched_cmds.append(shell_cmd)
                     return True
 
-                with patch.object(cs, "_open_pkg_install_terminal", side_effect=capture_launch):
+                with patch.object(cs, "_open_shell_in_terminal", side_effect=capture_launch):
                     with patch.object(cs, "_can_sudo", return_value=False):
                         res = cs.cmd_apply(env.ctx, argparse_ns(explicit=True, files="pkg-repo.txt,pkg-aur.txt", install_packages=True))
                 self.assertEqual(len(launched_cmds), 1)
@@ -2760,30 +2760,114 @@ class PackageTests(unittest.TestCase):
                 calls_out=calls,
             ):
                 cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
-                with patch.object(cs, "_open_pkg_install_terminal", return_value=False):
+                with patch.object(cs, "_open_shell_in_terminal", return_value=False):
                     with patch.object(cs, "_can_sudo", return_value=False):
                         res = cs.cmd_apply(env.ctx, argparse_ns(explicit=True, files="pkg-repo.txt", install_packages=True))
                 # Falls back to subprocess — which succeeds in the mock.
                 self.assertEqual(res["packages"]["installed"], ["brave"])
 
-    def test_open_pkg_install_terminal_prefers_omarchy_launcher(self) -> None:
+    def test_open_shell_in_terminal_prefers_omarchy_launcher(self) -> None:
         """On Omarchy the install goes through the floating presentation
         terminal (same as omarchy update / plugin clone)."""
         with patch.object(cs.shutil, "which", side_effect=lambda n: "/usr/bin/" + n if n == "omarchy-launch-floating-terminal-with-presentation" else None):
             with patch.object(cs.subprocess, "Popen") as popen:
-                self.assertTrue(cs._open_pkg_install_terminal("omarchy pkg add brave"))
+                self.assertTrue(cs._open_shell_in_terminal("omarchy pkg add brave"))
         popen.assert_called_once()
         self.assertEqual(
             popen.call_args[0][0],
             ["/usr/bin/omarchy-launch-floating-terminal-with-presentation", "omarchy pkg add brave"],
         )
 
-    def test_open_pkg_install_terminal_falls_back_to_generic(self) -> None:
+    def test_open_shell_in_terminal_falls_back_to_generic(self) -> None:
         """Without the Omarchy launcher the generic terminal launch is used."""
         with patch.object(cs.shutil, "which", return_value=None):
             with patch.object(cs, "_launch_command_in_terminal", return_value=True) as generic:
-                self.assertTrue(cs._open_pkg_install_terminal("omarchy pkg add brave"))
+                self.assertTrue(cs._open_shell_in_terminal("omarchy pkg add brave"))
         generic.assert_called_once_with(["/bin/sh", "-c", "omarchy pkg add brave"])
+
+
+class PacmanHookTests(unittest.TestCase):
+    def test_status_reports_missing_hook_and_persists(self) -> None:
+        """With no hook file, status reports not-installed and stores the
+        last known state so the panel can show it until the next check."""
+        with TempHome() as env:
+            missing = env.home / "hooks" / "config-sync.hook"
+            with patch.object(cs, "PACMAN_HOOK_FILE", str(missing)):
+                res = cs.cmd_pacman_hook(env.ctx, argparse_ns(args=["status"]))
+            self.assertIn("not installed", res["message"])
+            self.assertFalse(res["status"]["pacman_hook"]["installed"])
+            stored = cs.load_state(env.ctx)["pacman_hook"]
+            self.assertFalse(stored["installed"])
+            self.assertEqual(stored["path"], str(missing))
+            self.assertTrue(stored["checked_at"])
+
+    def test_status_reports_installed_managed_hook(self) -> None:
+        """A hook file with our marker counts as installed and managed."""
+        with TempHome() as env:
+            hook = env.home / "config-sync.hook"
+            hook.write_text(
+                "[Action]\nDescription = Flush Config Sync package cache after pacman transactions\n",
+                encoding="utf-8",
+            )
+            with patch.object(cs, "PACMAN_HOOK_FILE", str(hook)):
+                res = cs.cmd_pacman_hook(env.ctx, argparse_ns(args=["status"]))
+            self.assertIn("is installed", res["message"])
+            self.assertTrue(res["status"]["pacman_hook"]["installed"])
+            self.assertTrue(res["status"]["pacman_hook"]["managed"])
+
+    def test_status_marks_foreign_hook_unmanaged(self) -> None:
+        """A same-named hook without our marker is reported, not managed."""
+        with TempHome() as env:
+            hook = env.home / "config-sync.hook"
+            hook.write_text("[Action]\nDescription = Something else\n", encoding="utf-8")
+            with patch.object(cs, "PACMAN_HOOK_FILE", str(hook)):
+                info = cs.pacman_hook_state()
+            self.assertTrue(info["installed"])
+            self.assertFalse(info["managed"])
+
+    def test_install_launches_floating_terminal(self) -> None:
+        """Install needs root, so it opens in a terminal for the sudo prompt
+        instead of running in a background subprocess."""
+        with TempHome() as env:
+            launched: list[str] = []
+            with patch.object(cs, "_open_shell_in_terminal", side_effect=lambda c: launched.append(c) or True):
+                res = cs.cmd_pacman_hook(env.ctx, argparse_ns(args=["install"]))
+            self.assertEqual(len(launched), 1)
+            self.assertIn("pacman-hook.sh", launched[0])
+            self.assertIn("sudo", launched[0])
+            self.assertTrue(launched[0].rstrip().endswith("install"))
+            self.assertIn("floating terminal", res["message"])
+            self.assertIn("Check", res["message"])
+
+    def test_remove_alias_runs_uninstall(self) -> None:
+        """The panel's Remove button maps to the script's uninstall verb."""
+        with TempHome() as env:
+            launched: list[str] = []
+            with patch.object(cs, "_open_shell_in_terminal", side_effect=lambda c: launched.append(c) or True):
+                cs.cmd_pacman_hook(env.ctx, argparse_ns(args=["remove"]))
+            self.assertEqual(len(launched), 1)
+            self.assertTrue(launched[0].rstrip().endswith("uninstall"))
+
+    def test_install_without_terminal_raises_with_manual_command(self) -> None:
+        """If no terminal can be opened, the error tells the user the exact
+        manual command instead of failing silently."""
+        with TempHome() as env:
+            with patch.object(cs, "_open_shell_in_terminal", return_value=False):
+                with self.assertRaises(cs.SyncError) as raised:
+                    cs.cmd_pacman_hook(env.ctx, argparse_ns(args=["install"]))
+            self.assertIn("pacman-hook.sh install", str(raised.exception))
+
+    def test_snapshot_carries_hook_state(self) -> None:
+        """Every snapshot exposes the hook state so the Configs tab can
+        render it without an extra round-trip."""
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            missing = env.home / "hooks" / "config-sync.hook"
+            with patch.object(cs, "PACMAN_HOOK_FILE", str(missing)):
+                cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+                snap = cs.cmd_snapshot(env.ctx, argparse_ns(fetch=False))
+            self.assertIn("pacman_hook", snap["status"])
+            self.assertFalse(snap["status"]["pacman_hook"]["installed"])
 
 
 class PluginVersionTests(unittest.TestCase):

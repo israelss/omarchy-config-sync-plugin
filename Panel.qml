@@ -53,6 +53,8 @@ Panel {
   // is the restore path: installing what the repo lists is expected.
   readonly property bool applyInstallPackages: installPackagesTouched ? installPackages : missingPkgCount > 0
 
+  readonly property var pacmanHook: (status && status.pacman_hook) || (status && status.pacman_hook_last) || null
+  readonly property bool pacmanHookInstalled: pacmanHook ? !!pacmanHook.installed : false
   readonly property var pkgCounts: (status && status.packages && status.packages.counts) || null
   readonly property int missingPkgCount: pkgCounts ? Number(pkgCounts.missing || 0) : 0
   readonly property int unsyncedPkgCount: pkgCounts ? Number(pkgCounts.unsynced || 0) : 0
@@ -2206,6 +2208,75 @@ Panel {
         font.family: root.fontFamily
         font.pixelSize: Style.font.bodySmall
         wrapMode: Text.WordWrap
+      }
+
+      CardBox {
+        PanelSectionHeader { text: "PACMAN HOOK"; foreground: root.foreground; fontFamily: root.fontFamily }
+        Text {
+          width: parent.width
+          textFormat: Text.PlainText
+          text: {
+            if (!root.pacmanHook) return "Hook state unknown — press Check to verify."
+            var info = root.pacmanHook
+            if (info.installed) {
+              var extra = info.managed === false ? " (custom content)" : ""
+              return "Installed" + extra + " — " + String(info.path || "/etc/pacman.d/hooks/config-sync.hook")
+            }
+            return "Not installed — package lists refresh on a timer instead of after every pacman transaction."
+          }
+          color: root.pacmanHookInstalled ? root.accent : root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          font.bold: true
+          wrapMode: Text.WordWrap
+        }
+        Text {
+          width: parent.width
+          visible: root.pacmanHook && !!root.pacmanHook.checked_at
+          textFormat: Text.PlainText
+          text: "Last checked " + String((root.pacmanHook || {}).checked_at || "").slice(0, 19).replace("T", " ") + ". Install/remove needs sudo and opens a floating terminal — press Check again afterwards."
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
+        }
+        Row {
+          width: parent.width
+          spacing: Style.space(6)
+          Button {
+            text: "Check"
+            tooltipText: "Verify whether the pacman hook is installed"
+            fontSize: Style.font.caption
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            bordered: true
+            enabled: !root.busy
+            onClicked: root.run(["pacman-hook", "status"])
+          }
+          Button {
+            visible: !root.pacmanHookInstalled
+            text: "Install hook"
+            tooltipText: "Install the pacman hook (opens a floating terminal for the sudo password)"
+            fontSize: Style.font.caption
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            bordered: true
+            selected: true
+            enabled: !root.busy
+            onClicked: root.run(["pacman-hook", "install"])
+          }
+          Button {
+            visible: root.pacmanHookInstalled
+            text: "Remove hook"
+            tooltipText: "Remove the pacman hook (opens a floating terminal for the sudo password)"
+            fontSize: Style.font.caption
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            bordered: true
+            enabled: !root.busy
+            onClicked: root.run(["pacman-hook", "uninstall"])
+          }
+        }
       }
 
       CategorySection {

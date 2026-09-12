@@ -115,6 +115,12 @@ PKG_INSTALL_TIMEOUT = 1500
 OMARCHY_PKG_DIR = "/usr/share/omarchy/install"
 OMARCHY_PKG_FILES = ("omarchy-base.packages", "omarchy-other.packages")
 
+# Pacman hook that flushes the generated package lists after any transaction
+# (managed through scripts/pacman-hook.sh, which needs root for install/remove;
+# reading the hook file needs no privilege).
+PACMAN_HOOK_FILE = "/etc/pacman.d/hooks/config-sync.hook"
+PACMAN_HOOK_MARKER = "Flush Config Sync package cache after pacman transactions"
+
 
 class SyncError(Exception):
     def __init__(self, message: str, extra: dict[str, Any] | None = None):
@@ -1575,7 +1581,7 @@ def install_missing_packages(
             else:
                 cmds.append(f"{omarchy} pkg aur add {' '.join(shlex.quote(p) for p in pkgs)}")
         shell_cmd = " && ".join(cmds)
-        launched = _open_pkg_install_terminal(shell_cmd)
+        launched = _open_shell_in_terminal(shell_cmd)
         if launched:
             result["launched"] = True
             total = len(all_pkgs)
@@ -1615,6 +1621,59 @@ def install_missing_packages(
         if not result["failed"]:
             result["message"] = f"Installed {len(result['installed'])} package{'s' if len(result['installed']) != 1 else ''}."
     return result
+
+
+def pacman_hook_state() -> dict[str, Any]:
+    """Check whether the pacman PostTransaction hook is installed.
+
+    Reading the hook file needs no privilege; only install/remove run as
+    root (via scripts/pacman-hook.sh in a visible terminal)."""
+    path = Path(PACMAN_HOOK_FILE)
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else None
+    except OSError:
+        content = None
+    return {
+        "installed": content is not None,
+        "managed": bool(content) and PACMAN_HOOK_MARKER in content,
+        "path": str(path),
+        "checked_at": now_iso(),
+    }
+
+
+def cmd_pacman_hook(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
+    """Verify, install, or remove the pacman hook from the panel.
+
+    ``status`` re-checks the hook file and persists the last known state.
+    ``install``/``uninstall`` need root, so they open in a floating terminal
+    where sudo can prompt; the user re-checks afterwards to confirm."""
+    action = (args.args[0] if args.args else "status").lower()
+    if action not in {"status", "install", "uninstall", "remove"}:
+        raise SyncError("Usage: pacman-hook {status|install|uninstall}")
+    if action == "status":
+        state = load_state(ctx)
+        info = pacman_hook_state()
+        state["pacman_hook"] = {k: info[k] for k in ("installed", "managed", "path", "checked_at")}
+        save_state(ctx, state)
+        snap = build_snapshot(ctx, fetch=False)
+        snap.setdefault("status", {})["pacman_hook"] = info
+        snap["message"] = "Pacman hook is installed." if info["installed"] else "Pacman hook is not installed."
+        return snap
+    verb = "uninstall" if action in {"uninstall", "remove"} else "install"
+    script = Path(__file__).resolve().parent / "pacman-hook.sh"
+    shell_cmd = f"sudo bash {shlex.quote(str(script))} {verb}"
+    if not _open_shell_in_terminal(shell_cmd):
+        raise SyncError(
+            "Could not open a terminal. "
+            f"Run this in a terminal instead: sudo bash scripts/pacman-hook.sh {verb}"
+        )
+    snap = build_snapshot(ctx, fetch=False)
+    past = "removal" if verb == "uninstall" else "installation"
+    snap["message"] = (
+        f"Launched hook {past} in a floating terminal. "
+        "Enter your sudo password there, then press Check again to verify."
+    )
+    return snap
 
 
 def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
@@ -3095,6 +3154,8 @@ def build_snapshot(ctx: Context, fetch: bool = False) -> dict[str, Any]:
         "shortcut_changes": len([s for s in (diff.get("shortcuts") or []) if not s.get("hidden")]),
         "plugin_changes": len([p for p in (diff.get("plugins") or []) if not p.get("hidden")]),
         "packages": package_drift(ctx, repo),
+        "pacman_hook": pacman_hook_state(),
+        "pacman_hook_last": state.get("pacman_hook"),
         "hidden": state.get("hidden") or [],
         "hidden_count": len(state.get("hidden") or []),
         "plugin_version": PLUGIN_VERSION,
@@ -4297,10 +4358,12 @@ def _launch_command_in_terminal(cmd: list[str]) -> bool:
     return False
 
 
-def _open_pkg_install_terminal(shell_cmd: str) -> bool:
-    """Open a package install command in a user-visible terminal.
+def _open_shell_in_terminal(shell_cmd: str) -> bool:
+    """Open a shell command in a user-visible terminal.
 
-    Prefers Omarchy's floating presentation terminal (the same one used by
+    Used for privileged work (package installs, hook install/remove) where a
+    background subprocess cannot answer the sudo password prompt. Prefers
+    Omarchy's floating presentation terminal (the same one used by
     ``omarchy update`` and plugin clone/remove: logo up front, ``Done!
     Press any key to close...`` at the end, floated by the compositor via
     the ``org.omarchy.terminal`` app-id rule). Falls back to a plain
@@ -4499,6 +4562,7 @@ def build_parser() -> argparse.ArgumentParser:
             "unhide",
             "open",
             "terminal",
+            "pacman-hook",
         ],
     )
     parser.add_argument("args", nargs="*")
@@ -4553,6 +4617,8 @@ def dispatch(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         return cmd_open(ctx, args)
     if command == "terminal":
         return cmd_terminal(ctx, args)
+    if command == "pacman-hook":
+        return cmd_pacman_hook(ctx, args)
     raise SyncError(f"Unknown command: {command}")
 
 
