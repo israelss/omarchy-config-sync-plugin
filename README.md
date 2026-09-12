@@ -72,6 +72,7 @@ State lives in `~/.local/share/omarchy-config-sync/` so applying `shell.json` do
 | `omarchy/theme.name` | Selected theme (`omarchy theme set`); custom overlays under `omarchy/themes/<slug>/` (images skipped) |
 | `omarchy/{branding,extensions,hooks,agents}/` | same under `~/.config/omarchy/` |
 | `plugins/*` | `~/.config/omarchy/plugins/` (skips this plugin and other git-managed checkouts’ `.git`) |
+| `plugins/.origins.json` | Git origin URL + HEAD recorded per git-managed plugin at publish time, so Apply restores them with `git clone` and `omarchy plugin update` keeps working |
 | `bin/*` | `~/.local/bin/` |
 | `terminals/alacritty.toml` etc. | matching terminal config files |
 | `pkg-repo.txt`, `pkg-aur.txt` | Installed packages beyond Omarchy defaults (generated on this machine; synced to give other machines a starting list) |

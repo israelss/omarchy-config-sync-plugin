@@ -115,6 +115,16 @@ PKG_INSTALL_TIMEOUT = 1500
 OMARCHY_PKG_DIR = "/usr/share/omarchy/install"
 OMARCHY_PKG_FILES = ("omarchy-base.packages", "omarchy-other.packages")
 
+# Shell-plugin git origins. Publish records each git-managed local plugin's
+# origin URL + HEAD in plugins/.origins.json so Apply can `git clone` it
+# instead of copying files: only real checkouts are picked up by
+# `omarchy plugin update`. A dotfile at plugins/ root is never inventoried,
+# so the sidecar itself stays out of diffs.
+PLUGIN_ORIGINS_REL = "plugins/.origins.json"
+GIT_CLONE_TIMEOUT = 300
+_PLUGIN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]+$")
+_PLUGIN_ORIGIN_SCP_RE = re.compile(r"[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:.+")
+
 # Pacman hook that flushes the generated package lists after any transaction
 # (managed through scripts/pacman-hook.sh, which needs root for install/remove;
 # reading the hook file needs no privilege).
@@ -3572,6 +3582,217 @@ def _check_operation_size(paths: list[str], what: str) -> None:
         )
 
 
+def _valid_plugin_id(value: Any) -> bool:
+    """Plugin ids double as directory names; mirror omarchy's own rule."""
+    return bool(isinstance(value, str) and _PLUGIN_ID_RE.fullmatch(value) and ".." not in value)
+
+
+def _valid_plugin_origin(url: Any) -> str | None:
+    """Accept a git origin URL safe to pass as a single `git clone --` argv.
+
+    Remote URLs (https/ssh/scp syntax) and local paths/file:// (same-machine
+    origins, and what hermetic tests use) are fine. Anything that could escape
+    into an option, a second command, or another scheme is refused; callers
+    fall back to a plain file copy.
+    """
+    if not isinstance(url, str) or not url:
+        return None
+    if _CRLF_NUL_RE.search(url):
+        return None
+    if url[0] == "-" or any(ch.isspace() for ch in url):
+        return None
+    if url.startswith(("https://", "http://", "ssh://", "file://", "/")):
+        return url
+    if _PLUGIN_ORIGIN_SCP_RE.fullmatch(url):
+        return url
+    return None
+
+
+def local_plugin_origins(ctx: Context) -> dict[str, dict[str, str]]:
+    """Map each git-managed local plugin to its origin URL + HEAD.
+
+    Only checkouts with an origin remote are recorded; hand-copied plugin
+    dirs keep flowing through the file-copy path on Apply.
+    """
+    origins: dict[str, dict[str, str]] = {}
+    plugins_root = ctx.config_plugins
+    if not plugins_root.is_dir():
+        return origins
+    for child in sorted(plugins_root.iterdir()):
+        if not child.is_dir() or child.name.startswith(".") or child.name == PLUGIN_ID:
+            continue
+        if not _valid_plugin_id(child.name):
+            continue
+        if not (child / ".git").exists():
+            continue
+        try:
+            url_out = run_git(child, ["remote", "get-url", "origin"], timeout=20)
+        except (SyncError, OSError):
+            continue
+        if url_out.returncode != 0:
+            continue
+        url = _valid_plugin_origin(url_out.stdout.strip())
+        if not url:
+            continue
+        entry: dict[str, str] = {"url": url}
+        try:
+            head_out = run_git(child, ["rev-parse", "HEAD"], timeout=20)
+        except (SyncError, OSError):
+            head_out = None
+        if head_out is not None and head_out.returncode == 0:
+            head = head_out.stdout.strip()
+            if re.fullmatch(r"[0-9a-f]{40}", head):
+                entry["head"] = head
+        origins[child.name] = entry
+    return origins
+
+
+def refresh_plugin_origins(ctx: Context, repo: Path, published: list[str], removed: list[str]) -> None:
+    """Rewrite the origins sidecar when a publish touched plugins/.
+
+    `git add -A` in cmd_publish stages it, so it is committed alongside the
+    plugin files. Prunes entries for plugins that are gone.
+    """
+    if not any(p == "plugins" or p.startswith("plugins/") for p in list(published) + list(removed)):
+        return
+    sidecar = repo / PLUGIN_ORIGINS_REL
+    origins = local_plugin_origins(ctx)
+    if not origins:
+        try:
+            sidecar.unlink()
+        except OSError:
+            pass
+        return
+    try:
+        (repo / "plugins").mkdir(parents=True, exist_ok=True)
+        write_json(sidecar, origins, within=repo)
+    except (SyncError, OSError):
+        pass
+
+
+def read_plugin_origins(repo: Path) -> dict[str, dict[str, str]]:
+    """Read back the origins sidecar, dropping anything malformed.
+
+    Every key becomes a directory name and every URL a clone source on some
+    machine, so both are re-validated here even though publish wrote them.
+    """
+    sidecar = repo / PLUGIN_ORIGINS_REL
+    try:
+        if not sidecar.is_file() or file_too_large(sidecar, MAX_SYNC_FILE_BYTES):
+            return {}
+        data = load_json(sidecar, default={}, within=repo)
+    except (SyncError, OSError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, dict[str, str]] = {}
+    for pid, entry in data.items():
+        if not _valid_plugin_id(pid) or not isinstance(entry, dict):
+            continue
+        url = _valid_plugin_origin(entry.get("url"))
+        if not url:
+            continue
+        head = entry.get("head") or ""
+        if head and not re.fullmatch(r"[0-9a-f]{40}", head):
+            head = ""
+        out[pid] = {"url": url, "head": head}
+    return out
+
+
+def _clone_git_plugin(ctx: Context, plugin_id: str, url: str, head: str) -> bool:
+    """Clone one plugin into ~/.config/omarchy/plugins/<id>/.
+
+    Clones to a temp dir inside state_dir first (disk-budgeted), then swaps it
+    into place, and pins the recorded HEAD when it still resolves so Apply
+    reproduces the repo state exactly. Returns False on any failure; the
+    caller falls back to a plain file copy.
+    """
+    plugins_root = ctx.config_plugins
+    try:
+        root_resolved = plugins_root.resolve()
+        dest = plugins_root / plugin_id
+        if dest.is_symlink() or dest.resolve().parent != root_resolved:
+            return False
+    except OSError:
+        return False
+    try:
+        ctx.state_dir.mkdir(parents=True, exist_ok=True)
+        work = Path(tempfile.mkdtemp(prefix="plugin-clone-", dir=str(ctx.state_dir)))
+    except OSError:
+        return False
+    try:
+        checkout = work / plugin_id
+        proc = run_git(None, ["clone", "--", url, str(checkout)], timeout=GIT_CLONE_TIMEOUT, disk_root=work)
+        if proc.returncode != 0:
+            return False
+        if head:
+            reset = run_git(checkout, ["reset", "--hard", head], timeout=60)
+            if reset.returncode != 0:
+                # Upstream moved on (or the sha never existed there); a fresh
+                # checkout is still git-managed and updatable, so keep it.
+                pass
+        plugins_root.mkdir(parents=True, exist_ok=True)
+        if dest.exists() and not dest.is_symlink():
+            shutil.rmtree(dest, ignore_errors=True)
+        shutil.move(str(checkout), str(dest))
+        return dest.is_dir()
+    except (SyncError, OSError, subprocess.TimeoutExpired):
+        return False
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def restore_git_plugins(
+    ctx: Context, repo: Path, chosen: list[dict[str, Any]], *, dry_run: bool = False
+) -> tuple[list[str], list[str]]:
+    """Restore selected plugins via `git clone` when an origin is recorded.
+
+    Returns (cloned_ids, cloned_rels); the caller keeps those rels out of the
+    file-copy loop. Already git-managed dirs are left for
+    `omarchy plugin update`. Dirs with unselected local files are left for the
+    file copy too, so a clone never deletes data the backup did not capture.
+    Never raises: any failure falls back to the file copy.
+    """
+    origins = read_plugin_origins(repo)
+    if not origins:
+        return [], []
+    wanted: dict[str, list[str]] = {}
+    for item in chosen:
+        if item.get("removal") or not item.get("repo_exists"):
+            continue
+        pid = plugin_id_from_path(item.get("path") or "")
+        if pid not in origins or not _valid_plugin_id(pid):
+            continue
+        wanted.setdefault(pid, []).append(item["path"])
+    if not wanted:
+        return [], []
+    cloned_ids: list[str] = []
+    cloned_rels: list[str] = []
+    for pid in sorted(wanted):
+        dest = ctx.config_plugins / pid
+        try:
+            if (dest / ".git").exists():
+                continue
+            if dest.is_symlink():
+                continue
+            if dest.is_dir():
+                selected = {r.split("/", 2)[2] for r in wanted[pid] if r.count("/") >= 2}
+                local_files = {rel_posix(p, dest) for p in iter_files(dest)}
+                if not local_files <= selected:
+                    continue
+        except OSError:
+            continue
+        if dry_run:
+            cloned_ids.append(pid)
+            cloned_rels.extend(wanted[pid])
+            continue
+        entry = origins[pid]
+        if _clone_git_plugin(ctx, pid, entry["url"], entry.get("head") or ""):
+            cloned_ids.append(pid)
+            cloned_rels.extend(wanted[pid])
+    return cloned_ids, cloned_rels
+
+
 def strip_plugin_git_dirs(repo: Path) -> None:
     """Drop accidental .git dirs copied along with plugins before committing.
 
@@ -3751,14 +3972,22 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     pkg_wanted = bool(getattr(args, "install_packages", False))
     chosen = [i for i in chosen if not is_package_list_rel(i["path"])]
     pkg_plan = install_missing_packages(ctx, repo, dry_run=True) if pkg_wanted else {}
-    if not chosen and not shortcut_keys and not pkg_wanted:
+    # Plugins with a recorded git origin are restored via `git clone` (so
+    # `omarchy plugin update` keeps working) instead of a file copy. Already
+    # git-managed dirs are left for the platform updater.
+    is_dry = bool(getattr(args, "dry_run", False))
+    cloned_ids, cloned_rels = restore_git_plugins(ctx, repo, chosen, dry_run=is_dry)
+    if cloned_rels:
+        skip = set(cloned_rels)
+        chosen = [i for i in chosen if i["path"] not in skip]
+    if not chosen and not shortcut_keys and not pkg_wanted and not cloned_ids:
         snap = build_snapshot(ctx, fetch=False)
         snap["applied"] = []
         snap["removed"] = []
         snap["message"] = "Nothing to apply."
         return snap
 
-    if getattr(args, "dry_run", False):
+    if is_dry:
         applied = []
         removed = []
         for item in chosen:
@@ -3769,13 +3998,17 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
                 applied.append(item["path"])
         if shortcut_keys:
             applied.append("hypr/bindings.lua")
+        applied.extend(r for r in cloned_rels if r not in applied)
         snap = build_snapshot(ctx, fetch=False)
         snap["applied"] = applied
         snap["removed"] = removed
+        snap["cloned_plugins"] = cloned_ids
         snap["packages"] = pkg_plan if pkg_wanted else package_drift(ctx, repo)
         snap["dry_run"] = True
         msg = f"Dry run: would apply {len(applied)} file{'s' if len(applied) != 1 else ''}"
         msg += f" ({len(removed)} removed from this machine)" if removed else ""
+        if cloned_ids:
+            msg += f" ({len(cloned_ids)} plugin{'s' if len(cloned_ids) != 1 else ''} cloned from git)"
         if pkg_wanted:
             msg += f" {pkg_plan.get('message', '')}".strip()
         msg += "."
@@ -3826,6 +4059,7 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
             source_within=repo,
         ):
             applied.append("hypr/bindings.lua")
+    applied.extend(r for r in cloned_rels if r not in applied)
     restore_widget_entry(shell_path, section, widget_entry, widget_index, within=ctx.home)
 
     pkg_result = {}
@@ -3868,6 +4102,7 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         snap = build_snapshot(ctx, fetch=False)
         snap["applied"] = applied
         snap["backup_dir"] = str(backup_dir)
+        snap["cloned_plugins"] = cloned_ids
         snap["packages"] = {**package_drift(ctx, repo), **pkg_result}
         snap["message"] = pkg_result.get("message") or "Install launched in a terminal."
         snap["removed"] = removed
@@ -3884,6 +4119,7 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     snap = build_snapshot(ctx, fetch=False)
     snap["applied"] = applied
     snap["backup_dir"] = str(backup_dir)
+    snap["cloned_plugins"] = cloned_ids
     snap["reload"] = notes
     snap["packages"] = pkg_result if pkg_wanted else package_drift(ctx, repo)
     theme_msg = ""
@@ -4042,6 +4278,7 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
             published.append("hypr/bindings.lua")
 
     strip_plugin_git_dirs(repo)
+    refresh_plugin_origins(ctx, repo, published, removed)
 
     ensure_git_identity(repo)
     run_git(repo, ["add", "-A"], check=True)

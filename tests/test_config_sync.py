@@ -2993,6 +2993,213 @@ class PacmanHookTests(unittest.TestCase):
             self.assertFalse(snap["status"]["pacman_hook"]["installed"])
 
 
+class PluginCloneTests(unittest.TestCase):
+    """Plugins restored by Apply must come back as real git checkouts so
+    `omarchy plugin update` keeps managing them (it only looks at dirs
+    containing .git). Publish records origins; Apply clones them."""
+
+    @staticmethod
+    def _upstream(root: Path, pid: str, main_qml: str) -> Path:
+        src = root / f"{pid}-upstream"
+        init_repo(src)
+        write(
+            src / "manifest.json",
+            json.dumps({"schemaVersion": 1, "id": pid, "name": "Demo", "version": "1", "kinds": ["bar-widget"], "entryPoints": {"barWidget": "Main.qml"}}),
+        )
+        write(src / "Main.qml", main_qml)
+        commit_all(src, f"{pid} v1")
+        return src
+
+    @staticmethod
+    def _clone_plugin(env: TempHome, pid: str, upstream: Path) -> Path:
+        dest = env.ctx.config_plugins / pid
+        subprocess.run(
+            ["git", "clone", "--", str(upstream), str(dest)],
+            check=True,
+            capture_output=True,
+            env=git_test_env(),
+        )
+        return dest
+
+    @staticmethod
+    def _head(path: Path) -> str:
+        return git(path, "rev-parse", "HEAD").stdout.strip()
+
+    def test_valid_plugin_origin_accepts_and_rejects(self) -> None:
+        good = [
+            "https://github.com/acme/widget.git",
+            "http://intranet/g/widget",
+            "ssh://git@host/acme/widget.git",
+            "git@github.com:acme/widget.git",
+            "file:///srv/git/widget.git",
+            "/srv/git/widget.git",
+        ]
+        for url in good:
+            self.assertEqual(cs._valid_plugin_origin(url), url, url)
+        bad = ["", None, 42, "ext::sh -c touch /tmp/pwned", "-u https://x/y.git", "ftp://x/y.git", "github.com/a/b", "https://x/y\nevil", "https://x/y evil", "..", "C:\\x\\y"]
+        for url in bad:
+            self.assertIsNone(cs._valid_plugin_origin(url), url)
+        self.assertTrue(cs._valid_plugin_id("acme.widget"))
+        for pid in ["", "../evil", ".hidden", "-dash", "has space", "has/slash"]:
+            self.assertFalse(cs._valid_plugin_id(pid), pid)
+
+    def test_publish_records_origins_for_git_plugins(self) -> None:
+        with TempHome() as env:
+            upstream = self._upstream(env.home, "acme.widget", "import QtQuick\nItem {} // v1\n")
+            self._clone_plugin(env, "acme.widget", upstream)
+            plain = env.ctx.config_plugins / "plain.widget"
+            write(plain / "manifest.json", '{"schemaVersion": 1}')
+            write(plain / "Main.qml", "plain\n")
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            pub = cs.cmd_publish(env.ctx, argparse_ns(explicit=True, plugin=["acme.widget", "plain.widget"]))
+            self.assertTrue(pub["ok"], pub)
+            sidecar = json.loads((repo / "plugins" / ".origins.json").read_text(encoding="utf-8"))
+            self.assertEqual(sidecar["acme.widget"]["url"], str(upstream))
+            self.assertEqual(sidecar["acme.widget"]["head"], self._head(upstream))
+            self.assertNotIn("plain.widget", sidecar)
+
+    def test_publish_skips_checkout_without_origin(self) -> None:
+        with TempHome() as env:
+            lp = env.ctx.config_plugins / "local.widget"
+            init_repo(lp)
+            write(lp / "Main.qml", "local\n")
+            commit_all(lp, "local work")
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            pub = cs.cmd_publish(env.ctx, argparse_ns(explicit=True, plugin=["local.widget"]))
+            self.assertTrue(pub["ok"], pub)
+            self.assertFalse((repo / "plugins" / ".origins.json").exists())
+
+    def test_publish_prunes_stale_origin(self) -> None:
+        with TempHome() as env:
+            upstream = self._upstream(env.home, "acme.widget", "v1\n")
+            self._clone_plugin(env, "acme.widget", upstream)
+            repo = make_config_repo(env.home / "cfg")
+            write(repo / "plugins" / ".origins.json", json.dumps({"ghost.widget": {"url": "https://example.com/g.git", "head": "0" * 40}}))
+            commit_all(repo, "stale sidecar")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            cs.cmd_publish(env.ctx, argparse_ns(explicit=True, plugin=["acme.widget"]))
+            sidecar = json.loads((repo / "plugins" / ".origins.json").read_text(encoding="utf-8"))
+            self.assertNotIn("ghost.widget", sidecar)
+            self.assertIn("acme.widget", sidecar)
+
+    @staticmethod
+    def _shared_repo() -> Path:
+        tmp = Path(tempfile.mkdtemp())
+        return make_config_repo(tmp / "cfg")
+
+    def test_apply_clones_recorded_origin_at_recorded_head(self) -> None:
+        # Two machines sharing one config repo: A publishes, B restores.
+        with TempHome() as envA, TempHome() as envB:
+            repo = self._shared_repo()
+            self.addCleanup(shutil.rmtree, repo.parent, True)
+            upstream = self._upstream(repo.parent, "acme.widget", "v1\n")
+            self._clone_plugin(envA, "acme.widget", upstream)
+            cs.cmd_connect(envA.ctx, argparse_ns(args=[str(repo)]))
+            pub = cs.cmd_publish(envA.ctx, argparse_ns(explicit=True, plugin=["acme.widget"]))
+            self.assertTrue(pub["ok"], pub)
+            pinned = self._head(upstream)
+            write(upstream / "Main.qml", "v2\n")
+            commit_all(upstream, "v2 upstream")
+            self.assertNotEqual(pinned, self._head(upstream))
+            cs.cmd_connect(envB.ctx, argparse_ns(args=[str(repo)]))
+            ap = cs.cmd_apply(envB.ctx, argparse_ns(explicit=True, plugin=["acme.widget"]))
+            localB = envB.ctx.config_plugins / "acme.widget"
+            self.assertTrue(ap["ok"], ap)
+            self.assertEqual(ap.get("cloned_plugins"), ["acme.widget"])
+            self.assertTrue((localB / ".git").is_dir(), "restored plugin must be a git checkout for `omarchy plugin update`")
+            self.assertEqual(git(localB, "remote", "get-url", "origin").stdout.strip(), str(upstream))
+            # Pinned to the recorded HEAD, not to upstream's latest.
+            self.assertEqual(self._head(localB), pinned)
+            self.assertEqual((localB / "Main.qml").read_text(encoding="utf-8"), "v1\n")
+
+    def test_apply_falls_back_to_copy_without_origin(self) -> None:
+        with TempHome() as envA, TempHome() as envB:
+            repo = self._shared_repo()
+            self.addCleanup(shutil.rmtree, repo.parent, True)
+            plainA = envA.ctx.config_plugins / "plain.widget"
+            write(plainA / "Main.qml", "plain\n")
+            cs.cmd_connect(envA.ctx, argparse_ns(args=[str(repo)]))
+            cs.cmd_publish(envA.ctx, argparse_ns(explicit=True, plugin=["plain.widget"]))
+            cs.cmd_connect(envB.ctx, argparse_ns(args=[str(repo)]))
+            ap = cs.cmd_apply(envB.ctx, argparse_ns(explicit=True, plugin=["plain.widget"]))
+            plainB = envB.ctx.config_plugins / "plain.widget"
+            self.assertTrue(ap["ok"], ap)
+            self.assertEqual(ap.get("cloned_plugins"), [])
+            self.assertEqual((plainB / "Main.qml").read_text(encoding="utf-8"), "plain\n")
+            self.assertFalse((plainB / ".git").exists())
+
+    def test_apply_leaves_managed_checkout_alone(self) -> None:
+        with TempHome() as env:
+            upstream = self._upstream(env.home, "acme.widget", "v1\n")
+            local = self._clone_plugin(env, "acme.widget", upstream)
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            cs.cmd_publish(env.ctx, argparse_ns(explicit=True, plugin=["acme.widget"]))
+            # The repo copy moves on; the local checkout stays a checkout.
+            write(repo / "plugins" / "acme.widget" / "Main.qml", "v2\n")
+            commit_all(repo, "v2 in config repo")
+            real_run_git = cs.run_git
+            clones: list[list[str]] = []
+
+            def spy(repo_arg: Any, args: list[str], **kw: Any) -> Any:
+                if args and args[0] == "clone":
+                    clones.append(list(args))
+                return real_run_git(repo_arg, args, **kw)
+
+            with patch.object(cs, "run_git", side_effect=spy):
+                ap = cs.cmd_apply(env.ctx, argparse_ns(explicit=True, plugin=["acme.widget"]))
+            self.assertTrue(ap["ok"], ap)
+            self.assertEqual(clones, [], "managed checkouts are owned by `omarchy plugin update`, never re-cloned")
+            self.assertTrue((local / ".git").is_dir())
+            self.assertEqual((local / "Main.qml").read_text(encoding="utf-8"), "v2\n")
+
+    def test_restore_rejects_malicious_sidecar(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            write(
+                repo / "plugins" / ".origins.json",
+                json.dumps(
+                    {
+                        "../evil": {"url": "https://example.com/e.git", "head": "0" * 40},
+                        "bad.widget": {"url": "ext::sh -c touch /tmp/pwned", "head": ""},
+                        "dash.widget": {"url": "-u https://example.com/x.git", "head": ""},
+                    }
+                ),
+            )
+            chosen = [
+                {"path": "plugins/../evil/x", "repo_exists": True},
+                {"path": "plugins/bad.widget/Main.qml", "repo_exists": True},
+                {"path": "plugins/dash.widget/Main.qml", "repo_exists": True},
+            ]
+            ids, rels = cs.restore_git_plugins(env.ctx, repo, chosen, dry_run=False)
+            self.assertEqual((ids, rels), ([], []))
+            self.assertFalse((env.home / "evil").exists())
+            self.assertFalse((env.ctx.config_plugins / "bad.widget").exists())
+            self.assertFalse((env.ctx.config_plugins / "dash.widget").exists())
+
+    def test_apply_dry_run_reports_would_clone(self) -> None:
+        with TempHome() as envA, TempHome() as envB:
+            repo = self._shared_repo()
+            self.addCleanup(shutil.rmtree, repo.parent, True)
+            upstream = self._upstream(repo.parent, "acme.widget", "v1\n")
+            self._clone_plugin(envA, "acme.widget", upstream)
+            cs.cmd_connect(envA.ctx, argparse_ns(args=[str(repo)]))
+            cs.cmd_publish(envA.ctx, argparse_ns(explicit=True, plugin=["acme.widget"]))
+            cs.cmd_connect(envB.ctx, argparse_ns(args=[str(repo)]))
+            ap = cs.cmd_apply(envB.ctx, argparse_ns(explicit=True, plugin=["acme.widget"], dry_run=True))
+            self.assertTrue(ap["ok"], ap)
+            self.assertEqual(ap.get("cloned_plugins"), ["acme.widget"])
+            self.assertIn("cloned from git", ap.get("message") or "")
+            self.assertFalse((envB.ctx.config_plugins / "acme.widget" / ".git").exists(), "dry run must not clone")
+
+    def test_clone_failure_falls_back_to_copy(self) -> None:
+        with TempHome() as env:
+            self.assertFalse(cs._clone_git_plugin(env.ctx, "nope.widget", "/nonexistent/upstream-xyz", ""))
+            self.assertFalse((env.ctx.config_plugins / "nope.widget").exists())
+
+
 class PluginVersionTests(unittest.TestCase):
     def test_plugin_version_matches_manifest(self) -> None:
         """The helper reports its own version to the panel, so a release that
