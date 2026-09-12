@@ -1580,11 +1580,18 @@ def install_missing_packages(
                 cmds.append(f"{omarchy} pkg add {' '.join(shlex.quote(p) for p in pkgs)}")
             else:
                 cmds.append(f"{omarchy} pkg aur add {' '.join(shlex.quote(p) for p in pkgs)}")
-        shell_cmd = " && ".join(cmds)
+        total = len(all_pkgs)
+        shown = [p.replace("'", "") for p in all_pkgs[:10]]
+        if total > 10:
+            shown.append(f"… and {total - 10} more")
+        preamble = (
+            f"echo 'Omarchy Config Sync will install {total} "
+            f"package{'s' if total != 1 else ''}: {', '.join(shown)}' && echo '' && "
+        )
+        shell_cmd = preamble + " && ".join(cmds)
         launched = _open_shell_in_terminal(shell_cmd)
         if launched:
             result["launched"] = True
-            total = len(all_pkgs)
             result["message"] = (
                 f"Launched install of {total} package{'s' if total != 1 else ''} in a floating terminal. "
                 "Enter your sudo password there to proceed."
@@ -1661,7 +1668,12 @@ def cmd_pacman_hook(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         return snap
     verb = "uninstall" if action in {"uninstall", "remove"} else "install"
     script = Path(__file__).resolve().parent / "pacman-hook.sh"
-    shell_cmd = f"sudo bash {shlex.quote(str(script))} {verb}"
+    reason = (
+        "install the pacman hook (writes /etc/pacman.d/hooks/config-sync.hook, needs sudo)"
+        if verb == "install"
+        else "remove the pacman hook (deletes /etc/pacman.d/hooks/config-sync.hook, needs sudo)"
+    )
+    shell_cmd = f"echo 'Omarchy Config Sync will {reason}.' && echo '' && sudo bash {shlex.quote(str(script))} {verb}"
     if not _open_shell_in_terminal(shell_cmd):
         raise SyncError(
             "Could not open a terminal. "

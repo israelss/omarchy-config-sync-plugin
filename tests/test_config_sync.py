@@ -2736,6 +2736,10 @@ class PackageTests(unittest.TestCase):
                     with patch.object(cs, "_can_sudo", return_value=False):
                         res = cs.cmd_apply(env.ctx, argparse_ns(explicit=True, files="pkg-repo.txt,pkg-aur.txt", install_packages=True))
                 self.assertEqual(len(launched_cmds), 1)
+                self.assertIn(
+                    "Omarchy Config Sync will install 2 packages: brave, paru",
+                    launched_cmds[0],
+                )
                 self.assertIn("omarchy pkg add brave", launched_cmds[0])
                 self.assertIn("omarchy pkg aur add paru", launched_cmds[0])
                 self.assertTrue(res["packages"].get("launched"))
@@ -2833,6 +2837,7 @@ class PacmanHookTests(unittest.TestCase):
             with patch.object(cs, "_open_shell_in_terminal", side_effect=lambda c: launched.append(c) or True):
                 res = cs.cmd_pacman_hook(env.ctx, argparse_ns(args=["install"]))
             self.assertEqual(len(launched), 1)
+            self.assertIn("Omarchy Config Sync will install the pacman hook", launched[0])
             self.assertIn("pacman-hook.sh", launched[0])
             self.assertIn("sudo", launched[0])
             self.assertTrue(launched[0].rstrip().endswith("install"))
