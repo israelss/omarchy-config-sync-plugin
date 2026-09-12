@@ -2719,7 +2719,6 @@ class PackageTests(unittest.TestCase):
             write(repo / "pkg-repo.txt", "brave\n")
             write(repo / "pkg-aur.txt", "paru\n")
             commit_all(repo, "track packages")
-            launched_cmds: list[list[str]] = []
             with self._pkg_context(
                 explicit_repo=["firefox"],
                 explicit_aur=[],
@@ -2727,19 +2726,18 @@ class PackageTests(unittest.TestCase):
                 default_names=["firefox", "glibc"],
             ):
                 cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
-                original_launch = cs._launch_command_in_terminal
+                launched_cmds: list[str] = []
 
-                def capture_launch(cmd: list[str]) -> bool:
-                    launched_cmds.append(cmd)
+                def capture_launch(shell_cmd: str) -> bool:
+                    launched_cmds.append(shell_cmd)
                     return True
 
-                with patch.object(cs, "_launch_command_in_terminal", side_effect=capture_launch):
+                with patch.object(cs, "_open_pkg_install_terminal", side_effect=capture_launch):
                     with patch.object(cs, "_can_sudo", return_value=False):
                         res = cs.cmd_apply(env.ctx, argparse_ns(explicit=True, files="pkg-repo.txt,pkg-aur.txt", install_packages=True))
                 self.assertEqual(len(launched_cmds), 1)
-                script = launched_cmds[0][-1]  # the /bin/sh -c "..." arg
-                self.assertIn("omarchy pkg add brave", script)
-                self.assertIn("omarchy pkg aur add paru", script)
+                self.assertIn("omarchy pkg add brave", launched_cmds[0])
+                self.assertIn("omarchy pkg aur add paru", launched_cmds[0])
                 self.assertTrue(res["packages"].get("launched"))
                 self.assertIn("terminal", res["message"].lower())
                 # reload_desktop must NOT have been called (no shell restart).
@@ -2762,11 +2760,30 @@ class PackageTests(unittest.TestCase):
                 calls_out=calls,
             ):
                 cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
-                with patch.object(cs, "_launch_command_in_terminal", return_value=False):
+                with patch.object(cs, "_open_pkg_install_terminal", return_value=False):
                     with patch.object(cs, "_can_sudo", return_value=False):
                         res = cs.cmd_apply(env.ctx, argparse_ns(explicit=True, files="pkg-repo.txt", install_packages=True))
                 # Falls back to subprocess — which succeeds in the mock.
                 self.assertEqual(res["packages"]["installed"], ["brave"])
+
+    def test_open_pkg_install_terminal_prefers_omarchy_launcher(self) -> None:
+        """On Omarchy the install goes through the floating presentation
+        terminal (same as omarchy update / plugin clone)."""
+        with patch.object(cs.shutil, "which", side_effect=lambda n: "/usr/bin/" + n if n == "omarchy-launch-floating-terminal-with-presentation" else None):
+            with patch.object(cs.subprocess, "Popen") as popen:
+                self.assertTrue(cs._open_pkg_install_terminal("omarchy pkg add brave"))
+        popen.assert_called_once()
+        self.assertEqual(
+            popen.call_args[0][0],
+            ["/usr/bin/omarchy-launch-floating-terminal-with-presentation", "omarchy pkg add brave"],
+        )
+
+    def test_open_pkg_install_terminal_falls_back_to_generic(self) -> None:
+        """Without the Omarchy launcher the generic terminal launch is used."""
+        with patch.object(cs.shutil, "which", return_value=None):
+            with patch.object(cs, "_launch_command_in_terminal", return_value=True) as generic:
+                self.assertTrue(cs._open_pkg_install_terminal("omarchy pkg add brave"))
+        generic.assert_called_once_with(["/bin/sh", "-c", "omarchy pkg add brave"])
 
 
 class PluginVersionTests(unittest.TestCase):

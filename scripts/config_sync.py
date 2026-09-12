@@ -1575,13 +1575,12 @@ def install_missing_packages(
             else:
                 cmds.append(f"{omarchy} pkg aur add {' '.join(shlex.quote(p) for p in pkgs)}")
         shell_cmd = " && ".join(cmds)
-        terminal_cmd = f"echo 'Installing {len(all_pkgs)} package(s)…' && {shell_cmd} && echo 'Done. You can close this window.' || echo 'Install failed — check the output above.'; sleep 5"
-        launched = _launch_command_in_terminal(["/bin/sh", "-c", terminal_cmd])
+        launched = _open_pkg_install_terminal(shell_cmd)
         if launched:
             result["launched"] = True
             total = len(all_pkgs)
             result["message"] = (
-                f"Launched install of {total} package{'s' if total != 1 else ''} in a terminal. "
+                f"Launched install of {total} package{'s' if total != 1 else ''} in a floating terminal. "
                 "Enter your sudo password there to proceed."
             )
         else:
@@ -4296,6 +4295,31 @@ def _launch_command_in_terminal(cmd: list[str]) -> bool:
                 pass
 
     return False
+
+
+def _open_pkg_install_terminal(shell_cmd: str) -> bool:
+    """Open a package install command in a user-visible terminal.
+
+    Prefers Omarchy's floating presentation terminal (the same one used by
+    ``omarchy update`` and plugin clone/remove: logo up front, ``Done!
+    Press any key to close...`` at the end, floated by the compositor via
+    the ``org.omarchy.terminal`` app-id rule). Falls back to a plain
+    terminal launch on systems without the Omarchy launcher."""
+    devnull = subprocess.DEVNULL
+    env = os.environ.copy()
+    launcher = shutil.which("omarchy-launch-floating-terminal-with-presentation")
+    if launcher:
+        try:
+            subprocess.Popen(
+                [launcher, shell_cmd],
+                start_new_session=True,
+                stdin=devnull, stdout=devnull, stderr=devnull, close_fds=True,
+                env=env,
+            )
+            return True
+        except OSError:
+            pass
+    return _launch_command_in_terminal(["/bin/sh", "-c", shell_cmd])
 
 
 def _can_sudo() -> bool:
