@@ -3742,22 +3742,17 @@ def _move_staged_plugin(ctx: Context, staging: Path, plugin_id: str) -> bool:
         return False
 
 
-def restore_git_plugins(
-    ctx: Context, repo: Path, chosen: list[dict[str, Any]], *, dry_run: bool = False
-) -> tuple[list[str], list[str]]:
-    """Restore selected plugins via `git clone` when an origin is recorded.
+def plan_git_plugins(ctx: Context, repo: Path, chosen: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Select plugins to restore via `git clone`, without touching anything.
 
-    Returns (cloned_ids, cloned_rels); the caller keeps those rels out of the
-    file-copy loop. Already git-managed dirs are left for
-    `omarchy plugin update`. Dirs with unselected local files are left for the
-    file copy too, so a clone never deletes data the backup did not capture.
-    Clones land in staging first and move into place back-to-back, so the
-    shell's debounced plugin watcher reloads once, not once per plugin.
-    Never raises: any failure falls back to the file copy.
+    Returns pid -> {"rels", "url", "head"}. Guards only (read-only): already
+    git-managed dirs stay with the platform updater, and dirs with unselected
+    local files stay on the file copy so a clone never deletes data the
+    backup did not capture.
     """
     origins = read_plugin_origins(repo)
     if not origins:
-        return [], []
+        return {}
     wanted: dict[str, list[str]] = {}
     for item in chosen:
         if item.get("removal") or not item.get("repo_exists"):
@@ -3766,12 +3761,7 @@ def restore_git_plugins(
         if pid not in origins or not _valid_plugin_id(pid):
             continue
         wanted.setdefault(pid, []).append(item["path"])
-    if not wanted:
-        return [], []
-    # Guards first (no mutation): already-managed dirs stay with the platform
-    # updater, and dirs with unselected local files stay on the file copy so a
-    # clone never deletes data the backup did not capture.
-    candidates: list[str] = []
+    plan: dict[str, dict[str, Any]] = {}
     for pid in sorted(wanted):
         dest = ctx.config_plugins / pid
         try:
@@ -3786,11 +3776,26 @@ def restore_git_plugins(
                     continue
         except OSError:
             continue
-        candidates.append(pid)
-    if dry_run:
-        return candidates, [r for pid in candidates for r in wanted[pid]]
-    # Phase 1: clone everything into staging (unwatched by the shell), so the
-    # slow network work finishes before anything visible changes.
+        entry = origins[pid]
+        plan[pid] = {"rels": wanted[pid], "url": entry["url"], "head": entry.get("head") or ""}
+    return plan
+
+
+def execute_git_plugins(ctx: Context, plan: dict[str, dict[str, Any]]) -> tuple[list[str], list[str]]:
+    """Clone and move every planned plugin. Returns (cloned_ids, cloned_rels).
+
+    Phase 1 clones everything into staging under state_dir (never under the
+    watched plugins dir), so the slow network work finishes before anything
+    visible changes. Phase 2 moves the checkouts into place back-to-back;
+    the renames land milliseconds apart, so the shell's 150ms-debounced
+    plugin watcher fires a single reload instead of one per plugin.
+    Call this LAST in Apply, after files, packages, hashes, state, and the
+    desktop reload: anything after the moves races the watcher's teardown
+    of the panel, so the tail must stay tiny. Never raises: any failure
+    falls back to the file copy (rels simply stay out of the results).
+    """
+    if not plan:
+        return [], []
     try:
         ctx.state_dir.mkdir(parents=True, exist_ok=True)
         staging = ctx.state_dir / "plugin-staging"
@@ -3802,23 +3807,35 @@ def restore_git_plugins(
     except OSError:
         return [], []
     staged: list[str] = []
-    for pid in candidates:
-        entry = origins[pid]
-        if _clone_one_plugin(staging, pid, entry["url"], entry.get("head") or ""):
+    for pid in sorted(plan):
+        if _clone_one_plugin(staging, pid, plan[pid]["url"], plan[pid].get("head") or ""):
             staged.append(pid)
-    # Phase 2: move everything into place back-to-back. The renames land
-    # milliseconds apart, so the shell's 150ms-debounced plugin watcher fires
-    # a single reload instead of one per plugin.
     cloned_ids: list[str] = []
     cloned_rels: list[str] = []
     try:
         for pid in staged:
             if _move_staged_plugin(ctx, staging, pid):
                 cloned_ids.append(pid)
-                cloned_rels.extend(wanted[pid])
+                cloned_rels.extend(plan[pid]["rels"])
     finally:
         shutil.rmtree(staging, ignore_errors=True)
     return cloned_ids, cloned_rels
+
+
+def restore_git_plugins(
+    ctx: Context, repo: Path, chosen: list[dict[str, Any]], *, dry_run: bool = False
+) -> tuple[list[str], list[str]]:
+    """Plan, and unless dry_run execute, plugin restores via `git clone`.
+
+    Thin wrapper over plan_git_plugins + execute_git_plugins for callers
+    that do everything in one step. Never raises: any failure falls back
+    to the file copy.
+    """
+    plan = plan_git_plugins(ctx, repo, chosen)
+    if dry_run:
+        ids = sorted(plan)
+        return ids, [r for pid in ids for r in plan[pid]["rels"]]
+    return execute_git_plugins(ctx, plan)
 
 
 def strip_plugin_git_dirs(repo: Path) -> None:
@@ -4001,14 +4018,18 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     chosen = [i for i in chosen if not is_package_list_rel(i["path"])]
     pkg_plan = install_missing_packages(ctx, repo, dry_run=True) if pkg_wanted else {}
     # Plugins with a recorded git origin are restored via `git clone` (so
-    # `omarchy plugin update` keeps working) instead of a file copy. Already
-    # git-managed dirs are left for the platform updater.
+    # `omarchy plugin update` keeps working) instead of a file copy — but
+    # only planned here. Execution happens LAST (see below): every move into
+    # ~/.config/omarchy/plugins/ trips the shell's plugin watcher, whose
+    # debounced reload tears this panel down, so nothing slow may follow it.
+    # Already git-managed dirs are left for the platform updater.
     is_dry = bool(getattr(args, "dry_run", False))
-    cloned_ids, cloned_rels = restore_git_plugins(ctx, repo, chosen, dry_run=is_dry)
-    if cloned_rels:
-        skip = set(cloned_rels)
+    clone_plan = plan_git_plugins(ctx, repo, chosen)
+    planned_rels = [r for pid in sorted(clone_plan) for r in clone_plan[pid]["rels"]]
+    if planned_rels:
+        skip = set(planned_rels)
         chosen = [i for i in chosen if i["path"] not in skip]
-    if not chosen and not shortcut_keys and not pkg_wanted and not cloned_ids:
+    if not chosen and not shortcut_keys and not pkg_wanted and not clone_plan:
         snap = build_snapshot(ctx, fetch=False)
         snap["applied"] = []
         snap["removed"] = []
@@ -4016,6 +4037,8 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         return snap
 
     if is_dry:
+        cloned_ids = sorted(clone_plan)
+        cloned_rels = planned_rels
         applied = []
         removed = []
         for item in chosen:
@@ -4087,7 +4110,6 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
             source_within=repo,
         ):
             applied.append("hypr/bindings.lua")
-    applied.extend(r for r in cloned_rels if r not in applied)
     restore_widget_entry(shell_path, section, widget_entry, widget_index, within=ctx.home)
 
     pkg_result = {}
@@ -4123,9 +4145,41 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     state["last_pkg_counts"] = pkg_count_baseline(ctx, repo)
     save_state(ctx, state)
 
+    # The desktop reload only re-reads config (no widget teardown), but it is
+    # pointless when clones were the only work: the watcher rescans for them
+    # on its own. It runs BEFORE any plugin move, while the panel is alive.
+    # A terminal-launched package install skips it too (asynchronous work).
+    only_clones = not chosen and not shortcut_keys and not pkg_wanted
+    notes = {}
+    if not args.dry_run and not only_clones and not pkg_result.get("launched"):
+        notes = reload_desktop()
+        if THEME_REL in applied:
+            slug = read_theme_slug(ctx.theme_name_path, within=ctx.home)
+            theme_note = apply_omarchy_theme(slug, dry_run=False)
+            if theme_note:
+                notes["theme"] = theme_note
+
+    # LAST MUTATION — execute the planned plugin clones. Every move into the
+    # plugins dir trips the shell's watcher, whose debounced reload tears
+    # this panel down ~150ms later, so after this point only instant work
+    # remains: re-baseline the landed files, dump the snapshot, exit.
+    cloned_ids, cloned_rels = execute_git_plugins(ctx, clone_plan)
+    applied.extend(r for r in cloned_rels if r not in applied)
+    if cloned_rels:
+        hashes = dict(state.get("file_hashes") or {})
+        for rel in cloned_rels:
+            parts = rel.split("/")
+            if len(parts) < 3 or parts[0] != "plugins":
+                continue
+            lp = ctx.config_plugins.joinpath(*parts[1:])
+            live = file_hash(lp, rel, within=ctx.home) if lp.is_file() else None
+            if live:
+                hashes[rel] = live
+        state["file_hashes"] = hashes
+        save_state(ctx, state)
+
     # When the install was launched in a visible terminal the user must enter a
-    # sudo password interactively.  Skip reload_desktop() — the shell already
-    # picked up the file changes, and the package install is asynchronous.
+    # sudo password interactively; the package install is asynchronous.
     if pkg_result.get("launched"):
         snap = build_snapshot(ctx, fetch=False)
         snap["applied"] = applied
@@ -4136,19 +4190,6 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         snap["removed"] = removed
         return snap
 
-    # Plugin clones already tripped the shell's own directory watcher, which
-    # reloaded and rescanned for the batched moves. Reloading the desktop on
-    # top would tear the panel down a second time for nothing, so skip it
-    # when clones were the only work (no files, shortcuts, or packages).
-    only_clones = not chosen and not shortcut_keys and not pkg_wanted
-    notes = {}
-    if not args.dry_run and not only_clones:
-        notes = reload_desktop()
-        if THEME_REL in applied:
-            slug = read_theme_slug(ctx.theme_name_path, within=ctx.home)
-            theme_note = apply_omarchy_theme(slug, dry_run=False)
-            if theme_note:
-                notes["theme"] = theme_note
     snap = build_snapshot(ctx, fetch=False)
     snap["applied"] = applied
     snap["backup_dir"] = str(backup_dir)

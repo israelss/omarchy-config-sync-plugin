@@ -2998,6 +2998,8 @@ class PluginCloneTests(unittest.TestCase):
     `omarchy plugin update` keeps managing them (it only looks at dirs
     containing .git). Publish records origins; Apply clones them."""
 
+    _pkg_context = PackageTests._pkg_context
+
     @staticmethod
     def _upstream(root: Path, pid: str, main_qml: str) -> Path:
         src = root / f"{pid}-upstream"
@@ -3193,6 +3195,58 @@ class PluginCloneTests(unittest.TestCase):
             self.assertEqual(ap.get("cloned_plugins"), ["acme.widget"])
             self.assertIn("cloned from git", ap.get("message") or "")
             self.assertFalse((envB.ctx.config_plugins / "acme.widget" / ".git").exists(), "dry run must not clone")
+
+    def test_apply_installs_packages_and_reloads_before_cloning(self) -> None:
+        """Packages install and the desktop reloads BEFORE the first plugin
+        move trips the shell watcher's panel teardown — nothing slow or
+        stateful may follow the moves."""
+        with TempHome() as envA, TempHome() as envB:
+            repo = self._shared_repo()
+            self.addCleanup(shutil.rmtree, repo.parent, True)
+            upstream = self._upstream(repo.parent, "acme.widget", "v1\n")
+            self._clone_plugin(envA, "acme.widget", upstream)
+            write(repo / "pkg-repo.txt", "brave\n")
+            commit_all(repo, "track packages")
+            envA.ctx.track_packages = True
+            envB.ctx.track_packages = True
+            cs.cmd_connect(envA.ctx, argparse_ns(args=[str(repo)]))
+            cs.cmd_publish(envA.ctx, argparse_ns(explicit=True, plugin=["acme.widget"]))
+            cs.cmd_connect(envB.ctx, argparse_ns(args=[str(repo)]))
+            events: list[tuple[str, str]] = []
+
+            class EventLog(list):  # type: ignore[type-arg]
+                def append(self, cmd: list[str]) -> None:
+                    super().append(cmd)
+                    events.append(("pkg", cmd[-1]))
+
+            real_run_git = cs.run_git
+
+            def spy_git(repo_arg: Any, args: list[str], **kw: Any) -> Any:
+                if args and args[0] == "clone":
+                    events.append(("clone", args[-1]))
+                return real_run_git(repo_arg, args, **kw)
+
+            with self._pkg_context(
+                explicit_repo=["firefox"],
+                explicit_aur=[],
+                installed=["firefox", "glibc"],
+                default_names=["firefox", "glibc"],
+                calls_out=EventLog(),
+            ):
+                with patch.object(cs, "run_git", side_effect=spy_git):
+                    with patch.object(cs, "reload_desktop", side_effect=lambda: events.append(("reload", "")) or {}):
+                        ap = cs.cmd_apply(
+                            envB.ctx,
+                            argparse_ns(explicit=True, files="hypr/looknfeel.lua", plugin=["acme.widget"], install_packages=True),
+                        )
+            self.assertTrue(ap["ok"], ap)
+            self.assertEqual(ap.get("cloned_plugins"), ["acme.widget"])
+            kinds = [k for k, _ in events]
+            self.assertIn("pkg", kinds)
+            self.assertIn("reload", kinds)
+            self.assertIn("clone", kinds)
+            self.assertLess(kinds.index("pkg"), kinds.index("reload"))
+            self.assertLess(kinds.index("reload"), kinds.index("clone"))
 
     def test_clone_failure_falls_back_to_copy(self) -> None:
         with TempHome() as env:
