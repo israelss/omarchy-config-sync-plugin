@@ -3196,8 +3196,69 @@ class PluginCloneTests(unittest.TestCase):
 
     def test_clone_failure_falls_back_to_copy(self) -> None:
         with TempHome() as env:
-            self.assertFalse(cs._clone_git_plugin(env.ctx, "nope.widget", "/nonexistent/upstream-xyz", ""))
+            repo = make_config_repo(env.home / "cfg")
+            write(repo / "plugins" / ".origins.json", json.dumps({"nope.widget": {"url": "/nonexistent/upstream-xyz", "head": ""}}))
+            write(repo / "plugins" / "nope.widget" / "Main.qml", "v1\n")
+            chosen = [{"path": "plugins/nope.widget/Main.qml", "repo_exists": True}]
+            ids, rels = cs.restore_git_plugins(env.ctx, repo, chosen, dry_run=False)
+            self.assertEqual((ids, rels), ([], []))
             self.assertFalse((env.ctx.config_plugins / "nope.widget").exists())
+            self.assertFalse((env.ctx.state_dir / "plugin-staging").exists(), "staging must not leak after failure")
+
+    def test_apply_clones_multiple_plugins_in_one_go(self) -> None:
+        """All clones stage first and move back-to-back, so the shell's
+        debounced plugin watcher reloads once instead of once per plugin."""
+        with TempHome() as envA, TempHome() as envB:
+            repo = self._shared_repo()
+            self.addCleanup(shutil.rmtree, repo.parent, True)
+            for pid, body in (("one.widget", "one\n"), ("two.widget", "two\n")):
+                self._clone_plugin(envA, pid, self._upstream(repo.parent, pid, body))
+            cs.cmd_connect(envA.ctx, argparse_ns(args=[str(repo)]))
+            pub = cs.cmd_publish(envA.ctx, argparse_ns(explicit=True, plugin=["one.widget", "two.widget"]))
+            self.assertTrue(pub["ok"], pub)
+            cs.cmd_connect(envB.ctx, argparse_ns(args=[str(repo)]))
+            with patch.object(cs, "reload_desktop", return_value={}) as reload:
+                ap = cs.cmd_apply(envB.ctx, argparse_ns(explicit=True, plugin=["one.widget", "two.widget"]))
+            self.assertTrue(ap["ok"], ap)
+            self.assertEqual(ap.get("cloned_plugins"), ["one.widget", "two.widget"])
+            for pid in ("one.widget", "two.widget"):
+                self.assertTrue((envB.ctx.config_plugins / pid / ".git").is_dir())
+            self.assertFalse((envB.ctx.state_dir / "plugin-staging").exists())
+            reload.assert_not_called()
+
+    def test_apply_skips_reload_when_only_clones(self) -> None:
+        """The batched moves already tripped the shell watcher, so a desktop
+        reload on top would tear the panel down a second time for nothing."""
+        with TempHome() as envA, TempHome() as envB:
+            repo = self._shared_repo()
+            self.addCleanup(shutil.rmtree, repo.parent, True)
+            self._clone_plugin(envA, "acme.widget", self._upstream(repo.parent, "acme.widget", "v1\n"))
+            cs.cmd_connect(envA.ctx, argparse_ns(args=[str(repo)]))
+            cs.cmd_publish(envA.ctx, argparse_ns(explicit=True, plugin=["acme.widget"]))
+            cs.cmd_connect(envB.ctx, argparse_ns(args=[str(repo)]))
+            with patch.object(cs, "reload_desktop", return_value={}) as reload:
+                ap = cs.cmd_apply(envB.ctx, argparse_ns(explicit=True, plugin=["acme.widget"]))
+            self.assertTrue(ap["ok"], ap)
+            self.assertEqual(ap.get("cloned_plugins"), ["acme.widget"])
+            reload.assert_not_called()
+
+    def test_apply_reloads_when_clones_come_with_files(self) -> None:
+        """A mixed apply (clones plus a plain file copy) still reloads."""
+        with TempHome() as envA, TempHome() as envB:
+            repo = self._shared_repo()
+            self.addCleanup(shutil.rmtree, repo.parent, True)
+            self._clone_plugin(envA, "acme.widget", self._upstream(repo.parent, "acme.widget", "v1\n"))
+            plainA = envA.ctx.config_plugins / "plain.widget"
+            write(plainA / "Main.qml", "plain\n")
+            cs.cmd_connect(envA.ctx, argparse_ns(args=[str(repo)]))
+            cs.cmd_publish(envA.ctx, argparse_ns(explicit=True, plugin=["acme.widget", "plain.widget"]))
+            cs.cmd_connect(envB.ctx, argparse_ns(args=[str(repo)]))
+            with patch.object(cs, "reload_desktop", return_value={}) as reload:
+                ap = cs.cmd_apply(envB.ctx, argparse_ns(explicit=True, plugin=["acme.widget", "plain.widget"]))
+            self.assertTrue(ap["ok"], ap)
+            self.assertEqual(ap.get("cloned_plugins"), ["acme.widget"])
+            self.assertEqual((envB.ctx.config_plugins / "plain.widget" / "Main.qml").read_text(encoding="utf-8"), "plain\n")
+            reload.assert_called_once()
 
 
 class PluginVersionTests(unittest.TestCase):

@@ -3699,30 +3699,16 @@ def read_plugin_origins(repo: Path) -> dict[str, dict[str, str]]:
     return out
 
 
-def _clone_git_plugin(ctx: Context, plugin_id: str, url: str, head: str) -> bool:
-    """Clone one plugin into ~/.config/omarchy/plugins/<id>/.
+def _clone_one_plugin(staging: Path, plugin_id: str, url: str, head: str) -> bool:
+    """Clone one plugin into the staging dir and pin the recorded HEAD.
 
-    Clones to a temp dir inside state_dir first (disk-budgeted), then swaps it
-    into place, and pins the recorded HEAD when it still resolves so Apply
-    reproduces the repo state exactly. Returns False on any failure; the
-    caller falls back to a plain file copy.
+    Staging lives under state_dir (never under the watched plugins dir), so
+    slow clones never trip the shell's plugin watcher. Returns False on any
+    failure; the caller falls back to a plain file copy.
     """
-    plugins_root = ctx.config_plugins
+    checkout = staging / plugin_id
     try:
-        root_resolved = plugins_root.resolve()
-        dest = plugins_root / plugin_id
-        if dest.is_symlink() or dest.resolve().parent != root_resolved:
-            return False
-    except OSError:
-        return False
-    try:
-        ctx.state_dir.mkdir(parents=True, exist_ok=True)
-        work = Path(tempfile.mkdtemp(prefix="plugin-clone-", dir=str(ctx.state_dir)))
-    except OSError:
-        return False
-    try:
-        checkout = work / plugin_id
-        proc = run_git(None, ["clone", "--", url, str(checkout)], timeout=GIT_CLONE_TIMEOUT, disk_root=work)
+        proc = run_git(None, ["clone", "--", url, str(checkout)], timeout=GIT_CLONE_TIMEOUT, disk_root=staging)
         if proc.returncode != 0:
             return False
         if head:
@@ -3731,15 +3717,29 @@ def _clone_git_plugin(ctx: Context, plugin_id: str, url: str, head: str) -> bool
                 # Upstream moved on (or the sha never existed there); a fresh
                 # checkout is still git-managed and updatable, so keep it.
                 pass
+        return checkout.is_dir()
+    except (SyncError, OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _move_staged_plugin(ctx: Context, staging: Path, plugin_id: str) -> bool:
+    """Move one staged checkout into ~/.config/omarchy/plugins/<id>/."""
+    plugins_root = ctx.config_plugins
+    src = staging / plugin_id
+    dest = plugins_root / plugin_id
+    try:
+        if src.is_symlink() or not src.is_dir():
+            return False
+        root_resolved = plugins_root.resolve()
+        if dest.is_symlink() or dest.resolve().parent != root_resolved:
+            return False
         plugins_root.mkdir(parents=True, exist_ok=True)
         if dest.exists() and not dest.is_symlink():
             shutil.rmtree(dest, ignore_errors=True)
-        shutil.move(str(checkout), str(dest))
+        shutil.move(str(src), str(dest))
         return dest.is_dir()
-    except (SyncError, OSError, subprocess.TimeoutExpired):
+    except OSError:
         return False
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
 
 
 def restore_git_plugins(
@@ -3751,6 +3751,8 @@ def restore_git_plugins(
     file-copy loop. Already git-managed dirs are left for
     `omarchy plugin update`. Dirs with unselected local files are left for the
     file copy too, so a clone never deletes data the backup did not capture.
+    Clones land in staging first and move into place back-to-back, so the
+    shell's debounced plugin watcher reloads once, not once per plugin.
     Never raises: any failure falls back to the file copy.
     """
     origins = read_plugin_origins(repo)
@@ -3766,8 +3768,10 @@ def restore_git_plugins(
         wanted.setdefault(pid, []).append(item["path"])
     if not wanted:
         return [], []
-    cloned_ids: list[str] = []
-    cloned_rels: list[str] = []
+    # Guards first (no mutation): already-managed dirs stay with the platform
+    # updater, and dirs with unselected local files stay on the file copy so a
+    # clone never deletes data the backup did not capture.
+    candidates: list[str] = []
     for pid in sorted(wanted):
         dest = ctx.config_plugins / pid
         try:
@@ -3782,14 +3786,38 @@ def restore_git_plugins(
                     continue
         except OSError:
             continue
-        if dry_run:
-            cloned_ids.append(pid)
-            cloned_rels.extend(wanted[pid])
-            continue
+        candidates.append(pid)
+    if dry_run:
+        return candidates, [r for pid in candidates for r in wanted[pid]]
+    # Phase 1: clone everything into staging (unwatched by the shell), so the
+    # slow network work finishes before anything visible changes.
+    try:
+        ctx.state_dir.mkdir(parents=True, exist_ok=True)
+        staging = ctx.state_dir / "plugin-staging"
+        if staging.is_symlink():
+            staging.unlink()
+        elif staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+        staging.mkdir(parents=True)
+    except OSError:
+        return [], []
+    staged: list[str] = []
+    for pid in candidates:
         entry = origins[pid]
-        if _clone_git_plugin(ctx, pid, entry["url"], entry.get("head") or ""):
-            cloned_ids.append(pid)
-            cloned_rels.extend(wanted[pid])
+        if _clone_one_plugin(staging, pid, entry["url"], entry.get("head") or ""):
+            staged.append(pid)
+    # Phase 2: move everything into place back-to-back. The renames land
+    # milliseconds apart, so the shell's 150ms-debounced plugin watcher fires
+    # a single reload instead of one per plugin.
+    cloned_ids: list[str] = []
+    cloned_rels: list[str] = []
+    try:
+        for pid in staged:
+            if _move_staged_plugin(ctx, staging, pid):
+                cloned_ids.append(pid)
+                cloned_rels.extend(wanted[pid])
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
     return cloned_ids, cloned_rels
 
 
@@ -4108,8 +4136,13 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         snap["removed"] = removed
         return snap
 
+    # Plugin clones already tripped the shell's own directory watcher, which
+    # reloaded and rescanned for the batched moves. Reloading the desktop on
+    # top would tear the panel down a second time for nothing, so skip it
+    # when clones were the only work (no files, shortcuts, or packages).
+    only_clones = not chosen and not shortcut_keys and not pkg_wanted
     notes = {}
-    if not args.dry_run:
+    if not args.dry_run and not only_clones:
         notes = reload_desktop()
         if THEME_REL in applied:
             slug = read_theme_slug(ctx.theme_name_path, within=ctx.home)
